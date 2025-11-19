@@ -1,0 +1,43 @@
+# API Keys and sensitive data
+# Ignore all JSON files in api-key directory
+api-key/*.json
+# Ignore other JSON files in the repository
+*.json
+# Allow example API key file (must come after *.json)
+!api-key/api-key.example.json
+PRIVATE.md
+
+# Output files
+output/
+*.csv
+*.xls
+*.xlsx
+
+# Cache directories
+cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python virtual environment
+venv/
+env/
+.env
+
+# Cursor ignore
+.cursor/
+.cursorignore

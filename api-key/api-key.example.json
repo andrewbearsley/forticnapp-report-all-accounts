@@ -1,0 +1,6 @@
+{
+  "keyId": "YOUR_KEY_ID_HERE",
+  "secret": "YOUR_SECRET_HERE",
+  "account": "your-account.lacework.net",
+  "subAccount": "optional-subaccount-name"
+}

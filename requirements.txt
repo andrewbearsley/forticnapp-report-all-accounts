@@ -1,0 +1,8 @@
+# Python dependencies for forticnapp_get_consolidated_report.py
+# 
+# Install with: pip3 install -r requirements.txt
+
+openpyxl>=3.1.0
+
+
+
