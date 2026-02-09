@@ -41,3 +41,6 @@ env/
 # Cursor ignore
 .cursor/
 .cursorignore
+
+# Claude ignore
+CLAUDE.md

@@ -109,6 +109,8 @@ lacework report-definitions list
 
 This will show all available compliance reports with their names and types (AWS, Azure, or GCP).
 
+**Note**: The `report-definitions list` command may not show recently-added custom frameworks due to a known issue with the `/api/v2/ReportDefinitions` endpoint. For custom frameworks, use the `--cloud-type` flag to specify the cloud provider explicitly (see Options below).
+
 ## Usage
 
 ### Basic Syntax
@@ -120,11 +122,12 @@ python3 scripts/forticnapp_get_consolidated_report.py <api-key-path> <report-nam
 ### Arguments
 
 - `api-key-path`: Path to your Lacework API key JSON file
-- `report-name`: Name of the compliance report to fetch (must match exactly as shown in `lacework report-definitions list`)
+- `report-name`: Name of the compliance report to fetch
 
 ### Options
 
 - `-v, --verbose`: Enable verbose output for debugging
+- `--cloud-type {aws,azure,gcp}`: Cloud type override. Required for custom frameworks not listed in `report-definitions list`
 - `--use-cache`: Use cached account list data (useful for testing without making API calls)
 - `--no-concatenate`: Skip concatenation (reports will only be saved as individual JSON files in `output/`)
 - `--keep-intermediate`: Keep intermediate JSON files in `output/` directory after concatenation (default: files are cleaned up automatically)
@@ -155,6 +158,16 @@ python3 scripts/forticnapp_get_consolidated_report.py api-key/my-api-key.json "C
 python3 scripts/forticnapp_get_consolidated_report.py api-key/my-api-key.json "CIS Amazon Web Services Foundations Benchmark v1.4.0" -v
 ```
 
+#### Custom Frameworks
+
+```bash
+# Custom frameworks require --cloud-type since report-definitions may not list them
+python3 scripts/forticnapp_get_consolidated_report.py api-key/my-api-key.json "My Custom AWS Framework" --cloud-type aws
+
+# Custom Azure framework
+python3 scripts/forticnapp_get_consolidated_report.py api-key/my-api-key.json "UNSW - CIS Azure Foundations Benchmark v4.0.0" --cloud-type azure
+```
+
 #### Azure CIS Benchmark
 
 ```bash
@@ -177,7 +190,7 @@ python3 scripts/forticnapp_get_consolidated_report.py api-key/my-api-key.json "C
 
 ### Report Name Format
 
-Report names must match exactly as shown in `lacework report-definitions list`. Common CIS report names include:
+Report names must match exactly as configured in your Lacework instance. Common CIS report names include:
 
 - **AWS**: `"CIS Amazon Web Services Foundations Benchmark v1.4.0"`
 - **Azure**: `"CIS Microsoft Azure Foundations Benchmark v1.5.0"` or `"Azure CIS Benchmark"`
