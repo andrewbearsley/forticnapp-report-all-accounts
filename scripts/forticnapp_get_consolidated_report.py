@@ -174,9 +174,8 @@ class Logger:
 
     @staticmethod
     def error(msg: str) -> None:
-        """Print error message and exit."""
+        """Print error message."""
         print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}", file=sys.stderr)
-        sys.exit(1)
 
     @staticmethod
     def verbose(msg: str, enabled: bool = False) -> None:
@@ -193,16 +192,19 @@ def check_required_tools(output_format: OutputFormat) -> None:
     """Check if required tools are installed."""
     if not shutil.which("lacework"):
         Logger.error("lacework CLI is not installed. Please install it first.")
-    
+        sys.exit(1)
+
     if output_format == OutputFormat.EXCEL and not HAS_OPENPYXL:
         Logger.error("openpyxl is required for Excel output. Install it with: pip3 install openpyxl")
+        sys.exit(1)
 
 
 def load_api_key(api_key_path: str) -> Dict:
     """Load and validate API key from JSON file."""
     if not os.path.exists(api_key_path):
         Logger.error(f"API key file not found: {api_key_path}")
-    
+        sys.exit(1)
+
     with open(api_key_path, 'r') as f:
         api_key = json.load(f)
     
@@ -210,7 +212,8 @@ def load_api_key(api_key_path: str) -> Dict:
     missing = [field for field in required_fields if not api_key.get(field)]
     if missing:
         Logger.error(f"Invalid API key file. Missing required fields: {', '.join(missing)}")
-    
+        sys.exit(1)
+
     return api_key
 
 
@@ -238,7 +241,8 @@ def configure_lacework(api_key: Dict, verbose: bool) -> Dict[str, str]:
     
     if result.returncode != 0:
         Logger.error("Failed to configure Lacework CLI. Please check your API key.")
-    
+        sys.exit(1)
+
     Logger.info("Successfully configured Lacework CLI")
     return env
 
@@ -282,14 +286,18 @@ def make_api_call(
                 # Check if output is valid JSON despite non-zero exit
                 if _is_valid_json(output):
                     return output, False
-                Logger.error(f"Command failed with exit code {result.returncode}\n{output}")
-            
+                Logger.warning(f"Command failed with exit code {result.returncode}")
+                Logger.verbose(f"Output: {output}", verbose)
+                return "", False
+
             return output, False
-            
+
         except Exception as e:
-            Logger.error(f"Error executing command: {e}")
-    
-    Logger.error(f"Failed after {CONFIG.MAX_RETRIES} attempts")
+            Logger.warning(f"Error executing command: {e}")
+            return "", False
+
+    Logger.warning(f"Failed after {CONFIG.MAX_RETRIES} attempts")
+    return "", False
 
 
 def _check_rate_limit(output: str, exit_code: int) -> bool:
@@ -353,11 +361,12 @@ def get_report_info(report_name: str, env: Dict[str, str], verbose: bool) -> Opt
                 if cloud_type:
                     return cloud_type
         
-        Logger.error(f"Report '{report_name}' not found or invalid.")
+        Logger.warning(f"Report '{report_name}' not found in report-definitions.")
         return None
-        
+
     except json.JSONDecodeError:
-        Logger.error(f"Failed to parse report definitions. Output: {output}")
+        Logger.warning(f"Failed to parse report definitions response.")
+        return None
 
 
 def _extract_reports_list(definitions: Dict | List) -> List[Dict]:
@@ -683,7 +692,7 @@ class AzureAccountFetcher(AccountFetcher):
                     Logger.verbose(f"Could not parse subscriptions JSON for tenant {tenant_id}: {e}", self.verbose)
                     subscriptions = []
 
-                for sub in subscriptions if isinstance(subscriptions, list) else []:
+                for sub in subscriptions:
                     # Handle both dict and string formats
                     if isinstance(sub, dict):
                         sub_id = sub.get('subscription_id') or sub.get('id')
@@ -825,7 +834,8 @@ def get_accounts(
     fetcher_class = fetcher_classes.get(cloud_type)
     if not fetcher_class:
         Logger.error(f"Unknown cloud type: {cloud_type}")
-    
+        sys.exit(1)
+
     fetcher = fetcher_class(cloud_type, env, verbose, cache_dir)
     return fetcher.get_accounts(use_cache)
 
@@ -853,20 +863,16 @@ def get_report_for_account(
         Logger.warning("This account may be disabled or have no compliance data available")
         return False
 
-    if not _is_valid_json(output):
-        Logger.warning(f"Invalid JSON response for account: {account}")
-        if verbose:
-            Logger.verbose(f"Response was: {output}", verbose)
-        return False
-
     # Parse and unwrap the API response
     try:
         api_response = json.loads(output)
-        report_data = _unwrap_api_response(api_response, account, verbose)
-        if report_data is None:
-            return False
-    except json.JSONDecodeError:
-        Logger.warning(f"Failed to parse JSON response for account: {account}")
+    except (json.JSONDecodeError, ValueError):
+        Logger.warning(f"Invalid JSON response for account: {account}")
+        Logger.verbose(f"Response was: {output}", verbose)
+        return False
+
+    report_data = _unwrap_api_response(api_response, account, verbose)
+    if report_data is None:
         return False
 
     # Save the unwrapped report data
@@ -892,6 +898,7 @@ def _build_report_command(cloud_type: CloudType, report_name: str, account: str)
         params += f"&primaryQueryId={org_id}&secondaryQueryId={project_id}"
     else:
         Logger.error(f"Unknown cloud type: {cloud_type}")
+        sys.exit(1)
 
     return ['lacework', 'api', 'get', f'api/v2/Reports?{params}', '--json', '--noninteractive']
 
@@ -937,7 +944,8 @@ def create_excel_from_report(data: Dict, output_file: str) -> None:
     """Create Excel spreadsheet from report data."""
     if not HAS_OPENPYXL:
         Logger.error("openpyxl is required for Excel output. Install it with: pip3 install openpyxl")
-    
+        sys.exit(1)
+
     wb = Workbook()
     wb.remove(wb.active)  # Remove default sheet
     
@@ -1459,6 +1467,26 @@ def investigate_account(data: Dict, account_id: str) -> None:
     print()
 
 
+def _load_consolidated_data(report_output_dir: str, verbose: bool) -> Optional[Dict]:
+    """Load consolidated data from individual report files for investigation."""
+    report_files = []
+    for file in sorted(Path(report_output_dir).glob('*.json')):
+        if file.name != 'all_accounts.json':
+            report_files.append(file)
+    if not report_files:
+        return None
+    all_recommendations, _ = _collect_recommendations(report_files, verbose)
+    metadata = _extract_metadata(report_files[0])
+    summary = _calculate_aggregate_summary(report_files)
+    return {
+        'reportTitle': metadata['title'],
+        'reportType': metadata['type'],
+        'reportTime': metadata['time'],
+        'recommendations': all_recommendations,
+        'summary': [summary]
+    }
+
+
 # ============================================================================
 # Main Function
 # ============================================================================
@@ -1524,6 +1552,7 @@ For custom frameworks, specify --cloud-type explicitly:
                 "This may be a custom framework not listed in report-definitions. "
                 "Try specifying --cloud-type aws|azure|gcp explicitly."
             )
+            sys.exit(1)
         Logger.info(f"Report type: {cloud_type.value}")
     
     # Get accounts list
@@ -1592,22 +1621,7 @@ For custom frameworks, specify --cloud-type explicitly:
             
             # Load consolidated data for investigation if needed (before cleanup)
             if args.investigate_account:
-                # Load from intermediate files before they're cleaned up
-                report_files = []
-                for file in sorted(Path(report_output_dir).glob('*.json')):
-                    if file.name != 'all_accounts.json':
-                        report_files.append(file)
-                if report_files:
-                    all_recommendations, _ = _collect_recommendations(report_files, args.verbose)
-                    metadata = _extract_metadata(report_files[0])
-                    summary = _calculate_aggregate_summary(report_files)
-                    consolidated_data = {
-                        'reportTitle': metadata['title'],
-                        'reportType': metadata['type'],
-                        'reportTime': metadata['time'],
-                        'recommendations': all_recommendations,
-                        'summary': [summary]
-                    }
+                consolidated_data = _load_consolidated_data(report_output_dir, args.verbose)
             
             # Clean up intermediate files unless --keep-intermediate is specified
             if not args.keep_intermediate:
@@ -1623,27 +1637,13 @@ For custom frameworks, specify --cloud-type explicitly:
             Logger.warning("Intermediate files preserved for debugging")
             sys.exit(1)
     elif args.investigate_account:
-        # If no concatenation, load from intermediate files
-        report_files = []
-        for file in sorted(Path(report_output_dir).glob('*.json')):
-            if file.name != 'all_accounts.json':
-                report_files.append(file)
-        if report_files:
-            all_recommendations, _ = _collect_recommendations(report_files, args.verbose)
-            metadata = _extract_metadata(report_files[0])
-            summary = _calculate_aggregate_summary(report_files)
-            consolidated_data = {
-                'reportTitle': metadata['title'],
-                'reportType': metadata['type'],
-                'reportTime': metadata['time'],
-                'recommendations': all_recommendations,
-                'summary': [summary]
-            }
+        consolidated_data = _load_consolidated_data(report_output_dir, args.verbose)
     
     # Run investigation if requested
     if args.investigate_account:
         if not consolidated_data:
             Logger.error("Cannot investigate account: No consolidated data available. Run without --no-concatenate or ensure intermediate files exist.")
+            sys.exit(1)
             sys.exit(1)
         investigate_account(consolidated_data, args.investigate_account)
 
