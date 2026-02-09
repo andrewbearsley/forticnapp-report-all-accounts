@@ -5,6 +5,7 @@ Usage: python3 forticnapp_get_consolidated_report.py <api-key-path> <report-name
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -48,10 +50,10 @@ class Config:
     """Configuration constants."""
     # Rate limiting
     MAX_RETRIES: int = 5
-    BACKOFF_INCREMENT: int = 30  # seconds
+    BACKOFF_INCREMENT: int = 30  # seconds (backoff delay when rate limited)
     
     # Request delays
-    REQUEST_DELAY: float = 0.5  # seconds between requests
+    REQUEST_DELAY: float = 0.5  # seconds between requests (small delay to avoid hammering API)
     
     # Directories
     CACHE_DIR: str = 'cache'
@@ -661,19 +663,26 @@ class AzureAccountFetcher(AccountFetcher):
             else:
                 try:
                     sub_data = json.loads(sub_output)
-                    subscriptions = sub_data.get('azure_subscriptions', [])
-                    if not subscriptions and sub_output.strip():
-                        # If response is not empty but no subscriptions key, try parsing as array
-                        try:
-                            subscriptions = json.loads(sub_output)
-                            if not isinstance(subscriptions, list):
-                                subscriptions = []
-                        except (json.JSONDecodeError, TypeError):
-                            subscriptions = []
+                    if isinstance(sub_data, list):
+                        # Response is a list — may contain objects with nested 'subscriptions' arrays
+                        # e.g., [{"subscriptions": [{"id": "...", "alias": "..."}]}]
+                        subscriptions = []
+                        for item in sub_data:
+                            if isinstance(item, dict) and 'subscriptions' in item:
+                                subscriptions.extend(item['subscriptions'])
+                            elif isinstance(item, dict):
+                                subscriptions.append(item)
+                        # If no nested subscriptions found, use the list as-is
+                        if not subscriptions:
+                            subscriptions = sub_data
+                    elif isinstance(sub_data, dict):
+                        subscriptions = sub_data.get('azure_subscriptions', [])
+                    else:
+                        subscriptions = []
                 except json.JSONDecodeError as e:
                     Logger.verbose(f"Could not parse subscriptions JSON for tenant {tenant_id}: {e}", self.verbose)
                     subscriptions = []
-                
+
                 for sub in subscriptions if isinstance(subscriptions, list) else []:
                     # Handle both dict and string formats
                     if isinstance(sub, dict):
@@ -833,45 +842,91 @@ def get_report_for_account(
     env: Dict[str, str],
     verbose: bool
 ) -> bool:
-    """Get report for a specific account."""
+    """Get report for a specific account via /api/v2/Reports."""
     Logger.verbose(f"Fetching report '{report_name}' for {cloud_type.value} account: {account}", verbose)
-    
+
     cmd = _build_report_command(cloud_type, report_name, account)
     output, _ = make_api_call(cmd, env, verbose)
-    
+
     if not output:
         Logger.warning(f"No report data returned for account: {account}")
         Logger.warning("This account may be disabled or have no compliance data available")
         return False
-    
+
     if not _is_valid_json(output):
         Logger.warning(f"Invalid JSON response for account: {account}")
         if verbose:
             Logger.verbose(f"Response was: {output}", verbose)
         return False
-    
-    # Save to file
+
+    # Parse and unwrap the API response
+    try:
+        api_response = json.loads(output)
+        report_data = _unwrap_api_response(api_response, account, verbose)
+        if report_data is None:
+            return False
+    except json.JSONDecodeError:
+        Logger.warning(f"Failed to parse JSON response for account: {account}")
+        return False
+
+    # Save the unwrapped report data
     with open(output_file, 'w') as f:
-        f.write(output)
-    
+        json.dump(report_data, f, indent=2)
+
     Logger.verbose(f"Saved report for account '{account}' to: {output_file}", verbose)
     return True
 
 
 def _build_report_command(cloud_type: CloudType, report_name: str, account: str) -> List[str]:
-    """Build Lacework CLI command for getting a report."""
-    base_cmd = ['lacework', 'compliance', cloud_type.value]
-    
+    """Build Lacework API command for getting a report via /api/v2/Reports."""
+    encoded_name = urllib.parse.quote(report_name, safe='')
+    params = f"format=json&reportName={encoded_name}"
+
     if cloud_type == CloudType.AWS:
-        return base_cmd + ['get-report', account, '--report_name', report_name, '--json']
+        params += f"&primaryQueryId={account}"
     elif cloud_type == CloudType.AZURE:
         tenant_id, subscription_id = account.split('/', 1)
-        return base_cmd + ['get-report', tenant_id, subscription_id, '--report_name', report_name, '--json']
+        params += f"&primaryQueryId={tenant_id}&secondaryQueryId={subscription_id}"
     elif cloud_type == CloudType.GCP:
         org_id, project_id = account.split('/', 1)
-        return base_cmd + ['get-report', org_id, project_id, '--report_name', report_name, '--json']
+        params += f"&primaryQueryId={org_id}&secondaryQueryId={project_id}"
     else:
         Logger.error(f"Unknown cloud type: {cloud_type}")
+
+    return ['lacework', 'api', 'get', f'api/v2/Reports?{params}', '--json', '--noninteractive']
+
+
+def _unwrap_api_response(api_response, account: str, verbose: bool) -> Optional[Dict]:
+    """
+    Unwrap /api/v2/Reports response to match the format expected by downstream consumers.
+
+    API returns: {"data": [{reportType, reportTitle, recommendations, summary, ...}]}
+    Old CLI returned: {reportType, reportTitle, recommendations, summary, accountId, ...}
+
+    Extracts data[0] and ensures accountId is populated.
+    """
+    if isinstance(api_response, dict) and 'data' in api_response:
+        data_list = api_response['data']
+        if not data_list:
+            Logger.warning(f"Empty report data for account: {account}")
+            return None
+        report_data = data_list[0]
+    elif isinstance(api_response, dict):
+        report_data = api_response
+    else:
+        Logger.warning(f"Unexpected response format for account: {account}")
+        Logger.verbose(f"Response type: {type(api_response)}", verbose)
+        return None
+
+    # Inject accountId if missing (old CLI included it, API may not)
+    if not report_data.get('accountId'):
+        report_data['accountId'] = account
+
+    # Fallback reportTime if missing
+    if not report_data.get('reportTime'):
+        report_data['reportTime'] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    return report_data
 
 
 # ============================================================================
@@ -1416,14 +1471,17 @@ def main() -> None:
         epilog="""
 Examples:
   %(prog)s api-key/api-key.json "CIS Amazon Web Services Foundations Benchmark v1.4.0"
+  %(prog)s api-key/api-key.json "My Custom AWS Framework" --cloud-type aws
   %(prog)s api-key/api-key.json "CIS Microsoft Azure Foundations Benchmark v1.5.0" -v
   %(prog)s api-key/api-key.json "CIS Amazon Web Services Foundations Benchmark v1.4.0" -f json
   %(prog)s api-key/api-key.json "CIS Amazon Web Services Foundations Benchmark v1.4.0" -o my-report.xlsx
   %(prog)s api-key/api-key.json "CIS Amazon Web Services Foundations Benchmark v1.4.0" --no-concatenate
-  %(prog)s api-key/api-key.json "CIS Amazon Web Services Foundations Benchmark v1.4.0" --investigate-account 139956247214
 
-To find available compliance reports, use:
-  lacework report-definitions list
+To find available compliance reports:
+  lacework report-definitions list                    (may not show custom frameworks)
+
+For custom frameworks, specify --cloud-type explicitly:
+  %(prog)s api-key/api-key.json "My Custom Report" --cloud-type aws
         """
     )
     
@@ -1435,6 +1493,8 @@ To find available compliance reports, use:
     parser.add_argument('--keep-intermediate', action='store_true', help='Keep intermediate JSON files in output/ directory after concatenation')
     parser.add_argument('-f', '--format', choices=['json', 'excel'], default='excel', help='Output format for concatenation (default: excel)')
     parser.add_argument('-o', '--output', help='Output file path for concatenated report')
+    parser.add_argument('--cloud-type', choices=['aws', 'azure', 'gcp'],
+                        help='Cloud type override. Required for custom frameworks not listed in report-definitions.')
     parser.add_argument('--investigate-account', help='Investigate "Could Not Assess" issues for a specific account ID')
     
     args = parser.parse_args()
@@ -1452,11 +1512,19 @@ To find available compliance reports, use:
     env = configure_lacework(api_key, args.verbose)
     
     # Get report type (cloud type)
-    Logger.info("Validating report and determining cloud type...")
-    cloud_type = get_report_info(args.report_name, env, args.verbose)
-    if not cloud_type:
-        Logger.error("Failed to determine cloud type for report")
-    Logger.info(f"Report type: {cloud_type.value}")
+    if args.cloud_type:
+        cloud_type = CloudType(args.cloud_type)
+        Logger.info(f"Using specified cloud type: {cloud_type.value}")
+    else:
+        Logger.info("Validating report and determining cloud type...")
+        cloud_type = get_report_info(args.report_name, env, args.verbose)
+        if not cloud_type:
+            Logger.error(
+                f"Failed to determine cloud type for report '{args.report_name}'. "
+                "This may be a custom framework not listed in report-definitions. "
+                "Try specifying --cloud-type aws|azure|gcp explicitly."
+            )
+        Logger.info(f"Report type: {cloud_type.value}")
     
     # Get accounts list
     Logger.info(f"Fetching list of {cloud_type.value} accounts...")
