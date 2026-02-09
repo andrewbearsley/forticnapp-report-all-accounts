@@ -1548,16 +1548,23 @@ For custom frameworks, specify --cloud-type explicitly:
     
     for account_num, account in enumerate(accounts, 1):
         Logger.info(f"[{account_num}/{account_count}] Processing account: {account}")
-        
+
         # Sanitize account name for filename
         safe_account_name = account.replace('/', '_').replace(':', '_')
         output_file = os.path.join(report_output_dir, f"{safe_account_name}.json")
-        
+
         if get_report_for_account(cloud_type, args.report_name, account, output_file, env, args.verbose):
             success_count += 1
         else:
             failure_count += 1
             Logger.warning(f"Failed to get report for account: {account}")
+            # Fail fast: if the first account returns no data, the report name is likely wrong
+            if account_num == 1:
+                Logger.error(
+                    f"First account returned no data. Report name '{args.report_name}' "
+                    "may not exist. Please verify the report name and try again."
+                )
+                sys.exit(1)
         
         # Small delay between requests
         time.sleep(CONFIG.REQUEST_DELAY)
