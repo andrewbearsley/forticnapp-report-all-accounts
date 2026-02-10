@@ -950,7 +950,7 @@ def _unwrap_api_response(api_response, account: str, verbose: bool) -> Optional[
 # Excel Generation
 # ============================================================================
 
-def create_excel_from_report(data: Dict, output_file: str, include_compliant: bool = False) -> None:
+def create_excel_from_report(data: Dict, output_file: str, include_compliant: bool = False, tags_lookup: Dict = None) -> None:
     """Create Excel spreadsheet from report data."""
     if not HAS_OPENPYXL:
         Logger.error("openpyxl is required for Excel output. Install it with: pip3 install openpyxl")
@@ -960,7 +960,7 @@ def create_excel_from_report(data: Dict, output_file: str, include_compliant: bo
     wb.remove(wb.active)  # Remove default sheet
 
     _create_summary_sheet(wb, data)
-    _create_recommendations_sheet(wb, data, include_compliant)
+    _create_recommendations_sheet(wb, data, include_compliant, tags_lookup)
 
     wb.save(output_file)
 
@@ -1096,7 +1096,98 @@ def _add_metric_row(ws, row: int, label: str, value, right_align: bool = False) 
     ws.row_dimensions[row].height = 18
 
 
-def _expand_recommendations_to_rows(recommendations: List[Dict], include_compliant: bool = False) -> List[Dict]:
+def _collect_violation_urns(recommendations: List[Dict]) -> List[str]:
+    """Collect unique resource URNs from all violations across recommendations."""
+    urns = set()
+    for rec in recommendations:
+        for v in rec.get('VIOLATIONS', []):
+            resource = v.get('resource', '')
+            if resource and resource.startswith('arn:'):
+                urns.add(resource)
+    return list(urns)
+
+
+def _fetch_inventory_tags(
+    urns: List[str],
+    cloud_type: CloudType,
+    env: Dict[str, str],
+    verbose: bool
+) -> Dict[str, Dict]:
+    """
+    Batch-fetch resource tags from the Inventory API.
+
+    Calls POST /api/v2/Inventory/search with URN filters in batches of 100.
+    Returns {urn: {tag_key: tag_value}} for resources with non-empty tags.
+    On error, warns and returns partial results (never fails the report).
+    """
+    csp_map = {
+        CloudType.AWS: 'AWS',
+        CloudType.AZURE: 'Azure',
+        CloudType.GCP: 'GCP',
+    }
+    csp = csp_map.get(cloud_type)
+    if not csp:
+        Logger.warning(f"Unknown cloud type for inventory lookup: {cloud_type}")
+        return {}
+
+    BATCH_SIZE = 100
+    tags_lookup: Dict[str, Dict] = {}
+    total_batches = (len(urns) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for batch_num in range(total_batches):
+        start = batch_num * BATCH_SIZE
+        batch = urns[start:start + BATCH_SIZE]
+        Logger.verbose(
+            f"Fetching inventory tags batch {batch_num + 1}/{total_batches} "
+            f"({len(batch)} URNs)",
+            verbose
+        )
+
+        payload = json.dumps({
+            "csp": csp,
+            "filters": [
+                {"field": "urn", "expression": "in", "values": batch}
+            ],
+            "returns": ["urn", "resourceTags"]
+        })
+
+        cmd = [
+            'lacework', 'api', 'post', 'api/v2/Inventory/search',
+            '-d', payload, '--json', '--noninteractive'
+        ]
+
+        try:
+            output, _ = make_api_call(cmd, env, verbose)
+            if not output:
+                Logger.warning(f"Empty response for inventory batch {batch_num + 1}")
+                continue
+
+            response = json.loads(output)
+            data = response.get('data', []) if isinstance(response, dict) else []
+
+            for item in data:
+                urn = item.get('urn', '')
+                resource_tags = item.get('resourceTags', {})
+                # First non-empty tags per URN wins (multiple rows possible per URN)
+                if urn and resource_tags and urn not in tags_lookup:
+                    tags_lookup[urn] = resource_tags
+
+        except (json.JSONDecodeError, ValueError) as e:
+            Logger.warning(f"Failed to parse inventory response for batch {batch_num + 1}: {e}")
+            continue
+        except Exception as e:
+            Logger.warning(f"Error fetching inventory batch {batch_num + 1}: {e}")
+            continue
+
+        # Small delay between batches
+        if batch_num < total_batches - 1:
+            time.sleep(CONFIG.REQUEST_DELAY)
+
+    Logger.verbose(f"Inventory tag lookup complete: {len(tags_lookup)} resources with tags", verbose)
+    return tags_lookup
+
+
+def _expand_recommendations_to_rows(recommendations: List[Dict], include_compliant: bool = False, tags_lookup: Dict = None) -> List[Dict]:
     """
     Expand recommendations so each violation gets its own row.
 
@@ -1129,9 +1220,10 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
         if violations:
             for v in violations:
                 row = dict(base)
-                row['RESOURCE'] = v.get('resource', '')
-                # Try known tag field names from the API
-                tags = v.get('resourceTags') or v.get('tags') or {}
+                resource = v.get('resource', '')
+                row['RESOURCE'] = resource
+                # Prefer tags from inventory lookup, fall back to inline tags
+                tags = (tags_lookup.get(resource, {}) if tags_lookup else {}) or v.get('resourceTags') or v.get('tags') or {}
                 row['TAGS'] = json.dumps(tags) if tags else ''
                 rows.append(row)
         else:
@@ -1143,7 +1235,7 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
     return rows
 
 
-def _create_recommendations_sheet(wb: Workbook, data: Dict, include_compliant: bool = False) -> None:
+def _create_recommendations_sheet(wb: Workbook, data: Dict, include_compliant: bool = False, tags_lookup: Dict = None) -> None:
     """Create Recommendations sheet in workbook."""
     ws = wb.create_sheet("Recommendations", 1)
     recommendations = data.get('recommendations', [])
@@ -1152,7 +1244,7 @@ def _create_recommendations_sheet(wb: Workbook, data: Dict, include_compliant: b
         return
 
     # Expand violations to individual rows
-    expanded_rows = _expand_recommendations_to_rows(recommendations, include_compliant)
+    expanded_rows = _expand_recommendations_to_rows(recommendations, include_compliant, tags_lookup)
 
     if not expanded_rows:
         return
@@ -1282,31 +1374,45 @@ def concatenate_reports(
     output_format: OutputFormat,
     output_file: Optional[str],
     verbose: bool,
-    include_compliant: bool = False
+    include_compliant: bool = False,
+    env: Dict[str, str] = None,
+    cloud_type: CloudType = None,
+    skip_tags: bool = False
 ) -> str:
     """Concatenate individual report files into a single consolidated report."""
     Logger.verbose("Collecting recommendations from all accounts...", verbose)
-    
+
     report_files = _find_report_files(report_dir)
     if not report_files:
         raise FileNotFoundError(f"No JSON report files found in: {report_dir}")
-    
+
     Logger.verbose(f"Found {len(report_files)} report file(s)", verbose)
-    
+
     # Extract metadata from first file
     metadata = _extract_metadata(report_files[0])
     Logger.verbose(f"Report: {metadata['title']}", verbose)
     Logger.verbose(f"Type: {metadata['type']}", verbose)
     Logger.verbose(f"Time: {metadata['time']}", verbose)
-    
+
     # Collect all recommendations and calculate summary
     all_recommendations, all_accounts = _collect_recommendations(report_files, verbose)
     total_recommendations = len(all_recommendations)
     Logger.verbose(f"Total recommendations collected: {total_recommendations}", verbose)
-    
+
+    # Fetch resource tags from inventory API
+    tags_lookup = {}
+    if env and cloud_type and not skip_tags and output_format != OutputFormat.JSON:
+        urns = _collect_violation_urns(all_recommendations)
+        if urns:
+            Logger.info(f"Fetching tags for {len(urns)} unique resources from inventory...")
+            tags_lookup = _fetch_inventory_tags(urns, cloud_type, env, verbose)
+            Logger.info(f"Retrieved tags for {len(tags_lookup)} resources")
+        else:
+            Logger.verbose("No ARN resources found in violations, skipping tag fetch", verbose)
+
     Logger.verbose("Calculating overall summary...", verbose)
     summary = _calculate_aggregate_summary(report_files)
-    
+
     # Create consolidated data
     consolidated_data = {
         'reportTitle': metadata['title'],
@@ -1315,22 +1421,22 @@ def concatenate_reports(
         'recommendations': all_recommendations,
         'summary': [summary]
     }
-    
+
     # Determine output file (default to output directory)
     output_file = _determine_output_file(output_file, output_format, report_dir)
     _ensure_output_directory(output_file, verbose)
-    
+
     Logger.verbose(f"Output file: {output_file}", verbose)
-    
+
     # Generate output
     if output_format == OutputFormat.JSON:
         _write_json_output(consolidated_data, output_file, verbose)
     else:
-        _write_excel_output(consolidated_data, output_file, verbose, include_compliant)
-    
+        _write_excel_output(consolidated_data, output_file, verbose, include_compliant, tags_lookup)
+
     # Print summary
     _print_concatenation_summary(all_accounts, total_recommendations, output_file)
-    
+
     return report_dir
 
 
@@ -1428,10 +1534,10 @@ def _write_json_output(data: Dict, output_file: str, verbose: bool) -> None:
     Logger.info(f"Saved concatenated report to: {output_file}")
 
 
-def _write_excel_output(data: Dict, output_file: str, verbose: bool, include_compliant: bool = False) -> None:
+def _write_excel_output(data: Dict, output_file: str, verbose: bool, include_compliant: bool = False, tags_lookup: Dict = None) -> None:
     """Write consolidated data as Excel."""
     Logger.verbose("Creating Excel spreadsheet...", verbose)
-    create_excel_from_report(data, output_file, include_compliant)
+    create_excel_from_report(data, output_file, include_compliant, tags_lookup)
     Logger.info(f"Saved Excel spreadsheet to: {output_file}")
 
 
@@ -1586,6 +1692,8 @@ For custom frameworks, specify --cloud-type explicitly:
                         help='Include compliant policies (no violations) in the Excel output')
     parser.add_argument('--test', action='store_true',
                         help='Test mode: limit to first 3 accounts')
+    parser.add_argument('--skip-tags', action='store_true',
+                        help='Skip fetching resource tags from inventory API')
     parser.add_argument('--investigate-account', help='Investigate "Could Not Assess" issues for a specific account ID')
     
     args = parser.parse_args()
@@ -1683,7 +1791,9 @@ For custom frameworks, specify --cloud-type explicitly:
         print()
         Logger.info("Concatenating reports...")
         try:
-            concatenate_reports(report_output_dir, output_format, args.output, args.verbose, args.include_compliant)
+            concatenate_reports(report_output_dir, output_format, args.output, args.verbose,
+                                args.include_compliant, env=env, cloud_type=cloud_type,
+                                skip_tags=args.skip_tags)
             Logger.verbose("Successfully created concatenated report", args.verbose)
             
             # Load consolidated data for investigation if needed (before cleanup)
