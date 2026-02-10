@@ -129,7 +129,7 @@ class Config:
         if self.EXCEL_HEADERS is None:
             self.EXCEL_HEADERS = [
                 'Section', 'Service', 'Policy', 'Link', 'Severity', 'Account', 'Status',
-                'Resource Count', 'Assesed Count', 'Violated Count', 'Violations'
+                'Resource', 'Tags'
             ]
 
 
@@ -875,6 +875,16 @@ def get_report_for_account(
     if report_data is None:
         return False
 
+    # Log violation object structure for debugging
+    if verbose:
+        recs = report_data.get('recommendations', [])
+        for r in recs:
+            violations = r.get('VIOLATIONS', [])
+            if violations:
+                Logger.verbose(f"Violation object keys: {list(violations[0].keys())}", verbose)
+                Logger.verbose(f"Sample violation: {json.dumps(violations[0], indent=2)}", verbose)
+                break
+
     # Save the unwrapped report data
     with open(output_file, 'w') as f:
         json.dump(report_data, f, indent=2)
@@ -940,7 +950,7 @@ def _unwrap_api_response(api_response, account: str, verbose: bool) -> Optional[
 # Excel Generation
 # ============================================================================
 
-def create_excel_from_report(data: Dict, output_file: str) -> None:
+def create_excel_from_report(data: Dict, output_file: str, include_compliant: bool = False) -> None:
     """Create Excel spreadsheet from report data."""
     if not HAS_OPENPYXL:
         Logger.error("openpyxl is required for Excel output. Install it with: pip3 install openpyxl")
@@ -948,10 +958,10 @@ def create_excel_from_report(data: Dict, output_file: str) -> None:
 
     wb = Workbook()
     wb.remove(wb.active)  # Remove default sheet
-    
+
     _create_summary_sheet(wb, data)
-    _create_recommendations_sheet(wb, data)
-    
+    _create_recommendations_sheet(wb, data, include_compliant)
+
     wb.save(output_file)
 
 
@@ -1086,27 +1096,80 @@ def _add_metric_row(ws, row: int, label: str, value, right_align: bool = False) 
     ws.row_dimensions[row].height = 18
 
 
-def _create_recommendations_sheet(wb: Workbook, data: Dict) -> None:
+def _expand_recommendations_to_rows(recommendations: List[Dict], include_compliant: bool = False) -> List[Dict]:
+    """
+    Expand recommendations so each violation gets its own row.
+
+    For non-compliant recommendations with violations: one row per violation,
+    carrying the policy metadata plus the individual resource and tags.
+    For compliant recommendations (when include_compliant=True): one row with
+    empty Resource/Tags.
+    For non-compliant with no violations: one row with empty Resource/Tags.
+    """
+    rows = []
+    for rec in recommendations:
+        status = rec.get('STATUS', '')
+        violations = rec.get('VIOLATIONS', [])
+        is_non_compliant = status.lower() == 'noncompliant'
+
+        if not is_non_compliant and not include_compliant:
+            continue
+
+        # Base row data shared across all expanded rows for this recommendation
+        base = {
+            'CATEGORY': rec.get('CATEGORY', ''),
+            'SERVICE': rec.get('SERVICE', ''),
+            'TITLE': rec.get('TITLE', ''),
+            'REC_ID': rec.get('REC_ID', ''),
+            'SEVERITY': rec.get('SEVERITY', ''),
+            'ACCOUNT_ID': rec.get('ACCOUNT_ID', ''),
+            'STATUS': status,
+        }
+
+        if violations:
+            for v in violations:
+                row = dict(base)
+                row['RESOURCE'] = v.get('resource', '')
+                # Try known tag field names from the API
+                tags = v.get('resourceTags') or v.get('tags') or {}
+                row['TAGS'] = json.dumps(tags) if tags else ''
+                rows.append(row)
+        else:
+            row = dict(base)
+            row['RESOURCE'] = ''
+            row['TAGS'] = ''
+            rows.append(row)
+
+    return rows
+
+
+def _create_recommendations_sheet(wb: Workbook, data: Dict, include_compliant: bool = False) -> None:
     """Create Recommendations sheet in workbook."""
     ws = wb.create_sheet("Recommendations", 1)
     recommendations = data.get('recommendations', [])
-    
+
     if not recommendations:
         return
-    
-    # Sort recommendations
-    recommendations = sorted(recommendations, key=_recommendation_sort_key)
-    
+
+    # Expand violations to individual rows
+    expanded_rows = _expand_recommendations_to_rows(recommendations, include_compliant)
+
+    if not expanded_rows:
+        return
+
+    # Sort expanded rows
+    expanded_rows = sorted(expanded_rows, key=_recommendation_sort_key)
+
     # Write headers
     _write_excel_headers(ws, CONFIG.EXCEL_HEADERS)
-    
+
     # Write data rows
-    for row_num, rec in enumerate(recommendations, 2):
+    for row_num, rec in enumerate(expanded_rows, 2):
         _write_recommendation_row(ws, row_num, rec)
-    
+
     # Enable auto-filter
     ws.auto_filter.ref = ws.dimensions
-    
+
     # Auto-adjust column widths
     _adjust_column_widths(ws, len(CONFIG.EXCEL_HEADERS))
 
@@ -1119,16 +1182,18 @@ def _recommendation_sort_key(rec: Dict) -> Tuple:
     severity_label = CONFIG.SEVERITY_MAP.get(severity_num, 'Unknown')
     rec_id = rec.get('REC_ID', '')
     account_id = rec.get('ACCOUNT_ID', '')
-    
+    resource = rec.get('RESOURCE', '')
+
     # Service blank last
     service_sort = (1 if service else 2, service)
-    
+
     return (
         category,
         service_sort,
         CONFIG.SEVERITY_ORDER.get(severity_label, 99),
         rec_id,
-        account_id
+        account_id,
+        resource
     )
 
 
@@ -1151,11 +1216,11 @@ def _write_excel_headers(ws, headers: List[str]) -> None:
 def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     """Write a single recommendation row to Excel worksheet."""
     # Column mapping: Section, Service, Policy, Link, Severity, Account, Status,
-    # Resource Count, Assesed Count, Violated Count, Violations
+    # Resource, Tags
     ws.cell(row=row_num, column=1, value=rec.get('CATEGORY', ''))
     ws.cell(row=row_num, column=2, value=rec.get('SERVICE', ''))
     ws.cell(row=row_num, column=3, value=rec.get('TITLE', ''))
-    
+
     # REC_ID as hyperlink
     rec_id = rec.get('REC_ID', '')
     if rec_id:
@@ -1167,26 +1232,19 @@ def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
         cell.font = Font(color=CONFIG.EXCEL_LINK_COLOR, underline="single")
     else:
         ws.cell(row=row_num, column=4, value='')
-    
+
     # Severity as label
     severity = rec.get('SEVERITY', '')
     ws.cell(row=row_num, column=5, value=CONFIG.SEVERITY_MAP.get(severity, f'Unknown ({severity})'))
-    
+
     ws.cell(row=row_num, column=6, value=rec.get('ACCOUNT_ID', ''))
     # Format status for readability
     status = rec.get('STATUS', '')
     ws.cell(row=row_num, column=7, value=_format_status(status))
-    ws.cell(row=row_num, column=8, value=rec.get('RESOURCE_COUNT', 0))
-    ws.cell(row=row_num, column=9, value=rec.get('ASSESSED_RESOURCE_COUNT', 0))
-    
-    # Violation count
-    violations = rec.get('VIOLATIONS', [])
-    violation_count = len(violations) if violations else 0
-    ws.cell(row=row_num, column=10, value=violation_count)
-    
-    # Violations details
-    violation_resources = [v.get('resource', '') for v in violations if v.get('resource')]
-    ws.cell(row=row_num, column=11, value=', '.join(violation_resources))
+
+    # Individual resource and tags (from expanded row)
+    ws.cell(row=row_num, column=8, value=rec.get('RESOURCE', ''))
+    ws.cell(row=row_num, column=9, value=rec.get('TAGS', ''))
 
 
 def _format_status(status: str) -> str:
@@ -1223,7 +1281,8 @@ def concatenate_reports(
     report_dir: str,
     output_format: OutputFormat,
     output_file: Optional[str],
-    verbose: bool
+    verbose: bool,
+    include_compliant: bool = False
 ) -> str:
     """Concatenate individual report files into a single consolidated report."""
     Logger.verbose("Collecting recommendations from all accounts...", verbose)
@@ -1267,7 +1326,7 @@ def concatenate_reports(
     if output_format == OutputFormat.JSON:
         _write_json_output(consolidated_data, output_file, verbose)
     else:
-        _write_excel_output(consolidated_data, output_file, verbose)
+        _write_excel_output(consolidated_data, output_file, verbose, include_compliant)
     
     # Print summary
     _print_concatenation_summary(all_accounts, total_recommendations, output_file)
@@ -1369,10 +1428,10 @@ def _write_json_output(data: Dict, output_file: str, verbose: bool) -> None:
     Logger.info(f"Saved concatenated report to: {output_file}")
 
 
-def _write_excel_output(data: Dict, output_file: str, verbose: bool) -> None:
+def _write_excel_output(data: Dict, output_file: str, verbose: bool, include_compliant: bool = False) -> None:
     """Write consolidated data as Excel."""
     Logger.verbose("Creating Excel spreadsheet...", verbose)
-    create_excel_from_report(data, output_file)
+    create_excel_from_report(data, output_file, include_compliant)
     Logger.info(f"Saved Excel spreadsheet to: {output_file}")
 
 
@@ -1523,6 +1582,10 @@ For custom frameworks, specify --cloud-type explicitly:
     parser.add_argument('-o', '--output', help='Output file path for concatenated report')
     parser.add_argument('--cloud-type', choices=['aws', 'azure', 'gcp'],
                         help='Cloud type override. Required for custom frameworks not listed in report-definitions.')
+    parser.add_argument('--include-compliant', action='store_true',
+                        help='Include compliant policies (no violations) in the Excel output')
+    parser.add_argument('--test', action='store_true',
+                        help='Test mode: limit to first 3 accounts')
     parser.add_argument('--investigate-account', help='Investigate "Could Not Assess" issues for a specific account ID')
     
     args = parser.parse_args()
@@ -1563,6 +1626,10 @@ For custom frameworks, specify --cloud-type explicitly:
         Logger.warning(f"No accounts found for cloud type: {cloud_type.value}")
         sys.exit(0)
     
+    if args.test:
+        accounts = accounts[:3]
+        Logger.info(f"Test mode: limiting to first {len(accounts)} account(s)")
+
     account_count = len(accounts)
     Logger.info(f"Found {account_count} account(s)")
     
@@ -1616,7 +1683,7 @@ For custom frameworks, specify --cloud-type explicitly:
         print()
         Logger.info("Concatenating reports...")
         try:
-            concatenate_reports(report_output_dir, output_format, args.output, args.verbose)
+            concatenate_reports(report_output_dir, output_format, args.output, args.verbose, args.include_compliant)
             Logger.verbose("Successfully created concatenated report", args.verbose)
             
             # Load consolidated data for investigation if needed (before cleanup)
