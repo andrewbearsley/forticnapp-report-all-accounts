@@ -1097,12 +1097,23 @@ def _add_metric_row(ws, row: int, label: str, value, right_align: bool = False) 
 
 
 def _collect_violation_urns(recommendations: List[Dict]) -> List[str]:
-    """Collect unique resource URNs from all violations across recommendations."""
+    """Collect unique resource URNs from all violations across recommendations.
+
+    Matches AWS ARNs (arn:...) and Azure resource-level paths
+    (/subscriptions/.../resourceGroups/...). Skips bare subscription IDs,
+    location paths, and other non-resource identifiers.
+    """
     urns = set()
     for rec in recommendations:
         for v in rec.get('VIOLATIONS', []):
             resource = v.get('resource', '')
-            if resource and resource.startswith('arn:'):
+            if not resource:
+                continue
+            # AWS ARNs
+            if resource.startswith('arn:'):
+                urns.add(resource)
+            # Azure resource-level paths (skip subscription-only and location paths)
+            elif '/resourcegroups/' in resource.lower():
                 urns.add(resource)
     return list(urns)
 
