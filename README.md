@@ -133,6 +133,8 @@ python3 scripts/forticnapp_get_consolidated_report.py <api-key-path> <report-nam
 - `--keep-intermediate`: Keep intermediate JSON files in `output/` directory after concatenation (default: files are cleaned up automatically)
 - `-f, --format FORMAT`: Output format for concatenation: `json` or `excel` (default: `excel`)
 - `-o, --output FILE`: Output file path for concatenated report (default: `forticnapp-compliance-report.xlsx` or `.json`)
+- `--include-compliant`: Include all statuses in Excel output (default: only NonCompliant rows are shown)
+- `--test`: Test mode — limit to first 3 accounts for quick validation
 
 ### Examples
 
@@ -203,12 +205,14 @@ Report names must match exactly as configured in your Lacework instance. Common 
 **Excel Format** (default):
 - Creates a spreadsheet with two sheets:
   - **Summary**: Overall compliance statistics across all accounts
-  - **Recommendations**: Detailed list of all recommendations from all accounts
+  - **Recommendations**: One row per violation, with columns: Section, Service, Policy, Link, Severity, Account, Status, Resource, Tags
 - Features:
+  - Each violation expanded to its own row with the individual resource identifier
+  - Default: only NonCompliant rows shown (use `--include-compliant` for all statuses)
   - Auto-filters on all columns
   - Hyperlinked policy IDs (REC_ID) to Fortinet documentation
   - Severity labels (Critical, High, Medium, Low, Info)
-  - Sorted by Category > Service (blank last) > Severity > Rec_id > Account_id
+  - Sorted by Category > Service (blank last) > Severity > Rec_id > Account_id > Resource
 
 **JSON Format**:
 - Creates a single JSON file matching the structure of individual account reports
