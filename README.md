@@ -134,6 +134,7 @@ python3 scripts/forticnapp_get_consolidated_report.py <api-key-path> <report-nam
 - `-f, --format FORMAT`: Output format for concatenation: `json` or `excel` (default: `excel`)
 - `-o, --output FILE`: Output file path for concatenated report (default: `forticnapp-compliance-report.xlsx` or `.json`)
 - `--include-compliant`: Include all statuses in Excel output (default: only NonCompliant rows are shown)
+- `--skip-tags`: Skip fetching resource tags from the inventory API (tags column will be empty)
 - `--test`: Test mode — limit to first 3 accounts for quick validation
 
 ### Examples
@@ -208,6 +209,7 @@ Report names must match exactly as configured in your Lacework instance. Common 
   - **Recommendations**: One row per violation, with columns: Section, Service, Policy, Link, Severity, Account, Status, Resource, Tags
 - Features:
   - Each violation expanded to its own row with the individual resource identifier
+  - Resource tags fetched from the inventory API and populated in the Tags column (use `--skip-tags` to disable)
   - Default: only NonCompliant rows shown (use `--include-compliant` for all statuses)
   - Auto-filters on all columns
   - Hyperlinked policy IDs (REC_ID) to Fortinet documentation
