@@ -54,6 +54,7 @@ class Config:
     
     # Request delays
     REQUEST_DELAY: float = 0.5  # seconds between requests (small delay to avoid hammering API)
+    TAG_FETCH_DELAY: float = 2.0  # seconds between tag-fetch batches (higher to avoid 429 cascade)
     
     # Directories
     CACHE_DIR: str = 'cache'
@@ -259,9 +260,10 @@ def make_api_call(
 ) -> Tuple[str, bool]:
     """
     Make API call with rate limit handling.
-    
+
     Returns:
-        Tuple of (output, is_rate_limited)
+        Tuple of (output, was_rate_limited). was_rate_limited is True when
+        retries were exhausted due to rate limiting (output will be "").
     """
     while retry_count < CONFIG.MAX_RETRIES:
         Logger.verbose(f"Executing: {' '.join(cmd)}", verbose)
@@ -297,7 +299,7 @@ def make_api_call(
             return "", False
 
     Logger.warning(f"Failed after {CONFIG.MAX_RETRIES} attempts")
-    return "", False
+    return "", True
 
 
 def _check_rate_limit(output: str, exit_code: int) -> bool:
@@ -1142,17 +1144,26 @@ def _fetch_inventory_tags(
         return {}
 
     BATCH_SIZE = 100
+    MAX_REQUEUES = 2
+    RATE_LIMIT_COOLDOWN = 60  # seconds to wait after rate-limit exhaustion
     tags_lookup: Dict[str, Dict] = {}
-    total_batches = (len(urns) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    for batch_num in range(total_batches):
-        start = batch_num * BATCH_SIZE
-        batch = urns[start:start + BATCH_SIZE]
-        Logger.verbose(
-            f"Fetching inventory tags batch {batch_num + 1}/{total_batches} "
-            f"({len(batch)} URNs)",
-            verbose
+    # Build work queue: list of (batch_urns, requeue_count)
+    batches: List[Tuple[List[str], int]] = []
+    for i in range(0, len(urns), BATCH_SIZE):
+        batches.append((urns[i:i + BATCH_SIZE], 0))
+
+    total_batches = len(batches)
+    fetched_resources = 0
+    batch_index = 0
+
+    while batch_index < len(batches):
+        batch, requeue_count = batches[batch_index]
+        Logger.info(
+            f"Fetching tags for {fetched_resources}/{len(urns)} resources "
+            f"(batch {batch_index + 1}/{len(batches)})"
         )
+        Logger.verbose(f"  Batch has {len(batch)} URNs (requeue #{requeue_count})", verbose)
 
         payload = json.dumps({
             "csp": csp,
@@ -1168,9 +1179,29 @@ def _fetch_inventory_tags(
         ]
 
         try:
-            output, _ = make_api_call(cmd, env, verbose)
+            output, was_rate_limited = make_api_call(cmd, env, verbose)
+
+            if was_rate_limited:
+                if requeue_count < MAX_REQUEUES:
+                    Logger.warning(
+                        f"Rate-limited on batch {batch_index + 1} — "
+                        f"cooling down {RATE_LIMIT_COOLDOWN}s then retrying "
+                        f"(attempt {requeue_count + 1}/{MAX_REQUEUES})"
+                    )
+                    time.sleep(RATE_LIMIT_COOLDOWN)
+                    batches[batch_index] = (batch, requeue_count + 1)
+                    continue  # retry same batch_index without advancing
+                else:
+                    Logger.warning(
+                        f"Rate-limited on batch {batch_index + 1} after "
+                        f"{MAX_REQUEUES} re-queues — skipping batch"
+                    )
+                    batch_index += 1
+                    continue
+
             if not output:
-                Logger.warning(f"Empty response for inventory batch {batch_num + 1}")
+                Logger.warning(f"Empty response for inventory batch {batch_index + 1}")
+                batch_index += 1
                 continue
 
             response = json.loads(output)
@@ -1183,18 +1214,20 @@ def _fetch_inventory_tags(
                 if urn and resource_tags and urn not in tags_lookup:
                     tags_lookup[urn] = resource_tags
 
+            fetched_resources += len(batch)
+
         except (json.JSONDecodeError, ValueError) as e:
-            Logger.warning(f"Failed to parse inventory response for batch {batch_num + 1}: {e}")
-            continue
+            Logger.warning(f"Failed to parse inventory response for batch {batch_index + 1}: {e}")
         except Exception as e:
-            Logger.warning(f"Error fetching inventory batch {batch_num + 1}: {e}")
-            continue
+            Logger.warning(f"Error fetching inventory batch {batch_index + 1}: {e}")
 
-        # Small delay between batches
-        if batch_num < total_batches - 1:
-            time.sleep(CONFIG.REQUEST_DELAY)
+        batch_index += 1
 
-    Logger.verbose(f"Inventory tag lookup complete: {len(tags_lookup)} resources with tags", verbose)
+        # Delay between batches
+        if batch_index < len(batches):
+            time.sleep(CONFIG.TAG_FETCH_DELAY)
+
+    Logger.info(f"Tag lookup complete: {len(tags_lookup)}/{len(urns)} resources with tags")
     return tags_lookup
 
 
