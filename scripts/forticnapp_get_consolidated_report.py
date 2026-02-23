@@ -134,7 +134,7 @@ class Config:
         if self.EXCEL_HEADERS is None:
             self.EXCEL_HEADERS = [
                 'Section', 'Service', 'Policy', 'Link', 'Severity', 'Account', 'Status',
-                'Resource', 'Tags'
+                'Resource', 'Tags', 'Remediation'
             ]
 
 
@@ -1027,6 +1027,7 @@ def _fetch_all_policies(
             'infoLink': p.get('infoLink', ''),
             'tags': tags_dict,
             'description': p.get('description', ''),
+            'remediation': p.get('remediation', ''),
         }
     return lookup
 
@@ -1105,6 +1106,7 @@ def _build_recommendation_from_query(
         'RESOURCE_COUNT': 0,
         'SUPPRESSED_RESOURCE_COUNT': 0,
         'INFO_LINK': policy_meta.get('infoLink', ''),
+        'REMEDIATION': policy_meta.get('remediation', ''),
         'ACCOUNT_ID': account_id,
         'VIOLATIONS': mapped_violations,
     }
@@ -1802,6 +1804,7 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
             'SEVERITY': rec.get('SEVERITY', ''),
             'ACCOUNT_ID': rec.get('ACCOUNT_ID', ''),
             'STATUS': status,
+            'REMEDIATION': rec.get('REMEDIATION', ''),
         }
 
         if violations:
@@ -1924,6 +1927,7 @@ def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     # Individual resource and tags (from expanded row)
     ws.cell(row=row_num, column=8, value=rec.get('RESOURCE', ''))
     ws.cell(row=row_num, column=9, value=rec.get('TAGS', ''))
+    ws.cell(row=row_num, column=10, value=rec.get('REMEDIATION', ''))
 
 
 def _format_status(status: str) -> str:
