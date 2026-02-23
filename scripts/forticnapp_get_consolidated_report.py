@@ -63,6 +63,9 @@ class Config:
     # Default output files
     DEFAULT_EXCEL_OUTPUT: str = 'forticnapp-compliance-report.xlsx'
     DEFAULT_JSON_OUTPUT: str = 'forticnapp-compliance-report.json'
+
+    # Policy documentation URL template ({policy_id} placeholder, uppercased with hyphens→underscores)
+    POLICY_DOCS_URL: str = 'https://docs.fortinet.com/document/lacework-forticnapp/latest/lacework-forticnapp-policies?cshid={policy_id}'
     
     # Excel formatting
     EXCEL_HEADER_COLOR: str = "366092"
@@ -320,10 +323,6 @@ def _check_rate_limit(output: str, exit_code: int) -> bool:
         if re.search(pattern, output, re.IGNORECASE):
             return True
 
-    if exit_code != 0 and not _is_valid_json(output):
-        if re.search(r'(429|rate limit|too many requests)', output, re.IGNORECASE):
-            return True
-
     return False
 
 
@@ -381,7 +380,7 @@ def get_report_info(report_name: str, env: Dict[str, str], verbose: bool) -> Opt
         return None
 
 
-def _extract_reports_list(definitions: Dict | List) -> List[Dict]:
+def _extract_reports_list(definitions) -> List[Dict]:
     """Extract reports list from API response."""
     if isinstance(definitions, list):
         return definitions
@@ -953,7 +952,7 @@ def _unwrap_api_response(api_response, account: str, verbose: bool) -> Optional[
 
     # Fallback reportTime if missing
     if not report_data.get('reportTime'):
-        report_data['reportTime'] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        report_data['reportTime'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     return report_data
 
@@ -1042,7 +1041,7 @@ def _execute_policy_query(
     Returns list of violation rows. Each row typically contains ACCOUNT_ID,
     RESOURCE_KEY, RESOURCE_REGION, COMPLIANCE_FAILURE_REASON, etc.
     """
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
     start_time = (now - datetime.timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -1052,6 +1051,11 @@ def _execute_policy_query(
             {"name": "EndTimeRange", "value": end_time}
         ]
     })
+
+    # Validate query_id to prevent path traversal
+    if not re.match(r'^[A-Za-z0-9_-]+$', query_id):
+        Logger.warning(f"Invalid query_id format: {query_id} — skipping")
+        return []
 
     cmd = [
         'lacework', 'api', 'post', f'api/v2/Queries/{query_id}/execute',
@@ -1257,7 +1261,7 @@ def _fetch_reports_via_lql(
         )
 
     # 5. Build per-account JSON files
-    report_time = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    report_time = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     # All accounts: discovered + those found in query results
     all_account_ids = set(accounts) | set(account_violations.keys())
@@ -1558,7 +1562,7 @@ def _fetch_azure_tags_via_lql(
     )
 
     # Time range: last 7 days
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
     start_time = (now - datetime.timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -1921,7 +1925,7 @@ def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     rec_id = rec.get('REC_ID', '')
     if rec_id:
         rec_id_upper = rec_id.upper().replace('-', '_')
-        url = f"https://docs.fortinet.com/document/lacework-forticnapp/latest/lacework-forticnapp-policies?cshid={rec_id_upper}"
+        url = CONFIG.POLICY_DOCS_URL.format(policy_id=rec_id_upper)
         cell = ws.cell(row=row_num, column=7)
         cell.value = rec_id
         cell.hyperlink = url
@@ -1937,11 +1941,18 @@ def _format_status(status: str) -> str:
     """Format status value for better readability."""
     if not status:
         return ''
-    # Convert camelCase/PascalCase to readable format
-    # e.g., "CouldNotAssess" -> "Could Not Assess"
-    # Insert space before capital letters (but not at the start)
-    formatted = re.sub(r'(?<!^)(?=[A-Z])', ' ', status)
-    return formatted
+    # Handle known statuses explicitly, fall back to PascalCase splitting
+    status_map = {
+        'noncompliant': 'Non Compliant',
+        'compliant': 'Compliant',
+        'couldnotassess': 'Could Not Assess',
+        'suppressed': 'Suppressed',
+    }
+    mapped = status_map.get(status.lower())
+    if mapped:
+        return mapped
+    # Insert space before capital letters for unknown PascalCase values
+    return re.sub(r'(?<!^)(?=[A-Z])', ' ', status)
 
 
 def _adjust_column_widths(ws, num_columns: int) -> None:
@@ -2337,8 +2348,9 @@ For custom frameworks, specify --cloud-type explicitly:
     account_count = len(accounts)
     Logger.info(f"Found {account_count} account(s)")
     
-    # Create output directory
-    report_output_dir = os.path.join(CONFIG.OUTPUT_DIR, f"{args.report_name}_{cloud_type.value}")
+    # Create output directory (sanitize report name to prevent path traversal)
+    safe_report_name = args.report_name.replace('/', '_').replace('\\', '_').replace('..', '_')
+    report_output_dir = os.path.join(CONFIG.OUTPUT_DIR, f"{safe_report_name}_{cloud_type.value}")
     os.makedirs(report_output_dir, exist_ok=True)
     Logger.info(f"Output directory: {report_output_dir}")
     
@@ -2423,7 +2435,6 @@ For custom frameworks, specify --cloud-type explicitly:
     if args.investigate_account:
         if not consolidated_data:
             Logger.error("Cannot investigate account: No consolidated data available. Run without --no-concatenate or ensure intermediate files exist.")
-            sys.exit(1)
             sys.exit(1)
         investigate_account(consolidated_data, args.investigate_account)
 
