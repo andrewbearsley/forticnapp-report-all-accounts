@@ -100,6 +100,10 @@ class Config:
                 'Low': 4,
                 'Info': 5
             }
+        # Reverse mapping: Policies API severity strings -> report format numbers
+        self.SEVERITY_STRING_TO_NUM = {
+            'critical': 1, 'high': 2, 'medium': 3, 'low': 4, 'info': 5
+        }
         if self.RECOMMENDATIONS_FIELDS is None:
             # Policies overview section (total count)
             self.RECOMMENDATIONS_FIELDS = [
@@ -303,17 +307,23 @@ def make_api_call(
 
 
 def _check_rate_limit(output: str, exit_code: int) -> bool:
-    """Check if output indicates rate limiting."""
-    # Check explicit rate limit patterns
+    """Check if output indicates rate limiting.
+
+    Only checks error responses — valid JSON is never treated as rate-limited,
+    since large payloads (e.g. /api/v2/Policies) can contain false matches
+    like policy URLs with '1429' after 'HTTP'.
+    """
+    if exit_code == 0 and _is_valid_json(output):
+        return False
+
     for pattern in RATE_LIMIT_PATTERNS:
         if re.search(pattern, output, re.IGNORECASE):
             return True
-    
-    # Check if exit code is non-zero and output is not valid JSON
+
     if exit_code != 0 and not _is_valid_json(output):
         if re.search(r'(429|rate limit|too many requests)', output, re.IGNORECASE):
             return True
-    
+
     return False
 
 
@@ -949,6 +959,378 @@ def _unwrap_api_response(api_response, account: str, verbose: bool) -> Optional[
 
 
 # ============================================================================
+# LQL-Based Report Generation (default)
+# ============================================================================
+
+def _fetch_report_definition(
+    report_name: str,
+    env: Dict[str, str],
+    verbose: bool
+) -> Optional[Dict]:
+    """Fetch a report definition by name from GET /api/v2/ReportDefinitions."""
+    cmd = ['lacework', 'api', 'get', 'api/v2/ReportDefinitions', '--json', '--noninteractive']
+    output, _ = make_api_call(cmd, env, verbose)
+    if not output:
+        return None
+
+    try:
+        response = json.loads(output)
+        defs = response.get('data', response) if isinstance(response, dict) else response
+        for d in defs:
+            if d.get('reportName') == report_name:
+                return d
+    except (json.JSONDecodeError, ValueError) as e:
+        Logger.warning(f"Failed to parse ReportDefinitions response: {e}")
+    return None
+
+
+def _fetch_all_policies(
+    env: Dict[str, str],
+    verbose: bool
+) -> Dict[str, Dict]:
+    """Fetch all policies and build a {policyId: metadata} lookup.
+
+    Severity is converted from string to numeric (1-5).
+    """
+    cmd = ['lacework', 'api', 'get', 'api/v2/Policies', '--json', '--noninteractive']
+    output, _ = make_api_call(cmd, env, verbose)
+    if not output:
+        return {}
+
+    try:
+        response = json.loads(output)
+        policies = response.get('data', response) if isinstance(response, dict) else response
+    except (json.JSONDecodeError, ValueError) as e:
+        Logger.warning(f"Failed to parse Policies response: {e}")
+        return {}
+
+    lookup = {}
+    for p in policies:
+        pid = p.get('policyId', '')
+        if not pid:
+            continue
+        sev_str = p.get('severity', 'info')
+        # Tags come as list of "key:value" strings — convert to dict
+        raw_tags = p.get('tags', [])
+        tags_dict = {}
+        if isinstance(raw_tags, list):
+            for t in raw_tags:
+                if ':' in t:
+                    k, v = t.split(':', 1)
+                    tags_dict[k] = v
+        elif isinstance(raw_tags, dict):
+            tags_dict = raw_tags
+        lookup[pid] = {
+            'title': p.get('title', ''),
+            'severity': CONFIG.SEVERITY_STRING_TO_NUM.get(sev_str.lower(), 5),
+            'queryId': p.get('queryId'),
+            'infoLink': p.get('infoLink', ''),
+            'tags': tags_dict,
+            'description': p.get('description', ''),
+        }
+    return lookup
+
+
+def _execute_policy_query(
+    query_id: str,
+    env: Dict[str, str],
+    verbose: bool
+) -> List[Dict]:
+    """Execute a policy's LQL query via POST /api/v2/Queries/{queryId}/execute.
+
+    Returns list of violation rows. Each row typically contains ACCOUNT_ID,
+    RESOURCE_KEY, RESOURCE_REGION, COMPLIANCE_FAILURE_REASON, etc.
+    """
+    now = datetime.datetime.utcnow()
+    end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    start_time = (now - datetime.timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    payload = json.dumps({
+        "arguments": [
+            {"name": "StartTimeRange", "value": start_time},
+            {"name": "EndTimeRange", "value": end_time}
+        ]
+    })
+
+    cmd = [
+        'lacework', 'api', 'post', f'api/v2/Queries/{query_id}/execute',
+        '-d', payload, '--json', '--noninteractive'
+    ]
+
+    output, was_rate_limited = make_api_call(cmd, env, verbose)
+    if was_rate_limited or not output:
+        return []
+
+    try:
+        response = json.loads(output)
+        data = response.get('data', []) if isinstance(response, dict) else []
+        return data
+    except (json.JSONDecodeError, ValueError) as e:
+        Logger.warning(f"Failed to parse query response for {query_id}: {e}")
+        return []
+
+
+def _build_recommendation_from_query(
+    policy_id: str,
+    policy_meta: Dict,
+    violations: List[Dict],
+    account_id: str,
+    category: str
+) -> Dict:
+    """Build a recommendation dict matching the /api/v2/Reports format."""
+    if violations:
+        status = 'NonCompliant'
+    elif policy_meta.get('queryId'):
+        status = 'Compliant'
+    else:
+        status = 'CouldNotAssess'
+
+    mapped_violations = []
+    for v in violations:
+        mapped_violations.append({
+            'resource': v.get('RESOURCE_KEY', ''),
+            'region': v.get('RESOURCE_REGION', ''),
+            'reasonDescription': v.get('COMPLIANCE_FAILURE_REASON', ''),
+        })
+
+    return {
+        'REC_ID': policy_id,
+        'TITLE': policy_meta.get('title', ''),
+        'SEVERITY': policy_meta.get('severity', 5),
+        'CATEGORY': category,
+        'SERVICE': policy_meta.get('tags', {}).get('subdomain', ''),
+        'STATUS': status,
+        'NUM_VIOLATIONS': len(violations),
+        'ASSESSED_RESOURCE_COUNT': 0,
+        'RESOURCE_COUNT': 0,
+        'SUPPRESSED_RESOURCE_COUNT': 0,
+        'INFO_LINK': policy_meta.get('infoLink', ''),
+        'ACCOUNT_ID': account_id,
+        'VIOLATIONS': mapped_violations,
+    }
+
+
+def _fetch_reports_via_lql(
+    report_name: str,
+    cloud_type: CloudType,
+    accounts: List[str],
+    report_output_dir: str,
+    env: Dict[str, str],
+    verbose: bool,
+    test_mode: bool = False
+) -> Tuple[int, int]:
+    """
+    Fetch compliance report via individual LQL policy queries.
+
+    Fallback for when /api/v2/Reports returns 500 errors. Executes each
+    policy's underlying query, groups violations by account, and writes
+    per-account JSON files in the same format as get_report_for_account().
+
+    Returns (success_count, failure_count).
+    """
+    # 1. Fetch report definition
+    Logger.info(f"Fetching report definition for '{report_name}'...")
+    report_def = _fetch_report_definition(report_name, env, verbose)
+    if not report_def:
+        Logger.error(
+            f"Report definition '{report_name}' not found. "
+            "Check the name with: lacework report-definitions list"
+        )
+        sys.exit(1)
+
+    sections = report_def.get('reportDefinition', {}).get('sections', [])
+    if not sections:
+        Logger.error(f"Report '{report_name}' has no sections")
+        sys.exit(1)
+
+    # 2. Fetch all policies
+    Logger.info("Fetching policy metadata...")
+    all_policies = _fetch_all_policies(env, verbose)
+    if not all_policies:
+        Logger.error("Failed to fetch policies")
+        sys.exit(1)
+    Logger.info(f"Loaded metadata for {len(all_policies)} policies")
+
+    # 3. Extract policy IDs from sections
+    policy_section_map: Dict[str, str] = {}  # {policy_id: category}
+    all_policy_ids: List[str] = []
+    for section in sections:
+        category = section.get('category', section.get('title', ''))
+        for pid in section.get('policies', []):
+            policy_section_map[pid] = category
+            all_policy_ids.append(pid)
+
+    Logger.info(
+        f"Report has {len(sections)} sections, "
+        f"{len(all_policy_ids)} policies"
+    )
+
+    # Test mode: limit to first 3 policies per section
+    if test_mode:
+        limited_ids = []
+        section_counts: Dict[str, int] = {}
+        for pid in all_policy_ids:
+            cat = policy_section_map[pid]
+            section_counts[cat] = section_counts.get(cat, 0) + 1
+            if section_counts[cat] <= 3:
+                limited_ids.append(pid)
+        all_policy_ids = limited_ids
+        Logger.info(
+            f"Test mode: limiting to {len(all_policy_ids)} policies "
+            f"(3 per section)"
+        )
+
+    # 4. Execute each policy query
+    # {account_id: {policy_id: [violations]}}
+    account_violations: Dict[str, Dict[str, List[Dict]]] = {}
+    null_query_policies: List[str] = []
+    policy_count = len(all_policy_ids)
+
+    def _extract_account_key(violation: Dict, ct: CloudType) -> str:
+        """Extract account key from a violation row.
+
+        AWS queries return ACCOUNT_ID. Azure returns TENANT_ID/SUBSCRIPTION_ID.
+        GCP returns PROJECT_ID (with org handled at account discovery level).
+        """
+        if ct == CloudType.AZURE:
+            tenant = violation.get('TENANT_ID', '')
+            sub = violation.get('SUBSCRIPTION_ID', '')
+            if tenant and sub:
+                return f"{tenant}/{sub}"
+            return ''
+        if ct == CloudType.GCP:
+            return violation.get('PROJECT_ID', violation.get('ACCOUNT_ID', ''))
+        return violation.get('ACCOUNT_ID', '')
+
+    for i, policy_id in enumerate(all_policy_ids):
+        policy_meta = all_policies.get(policy_id)
+        if not policy_meta:
+            Logger.warning(f"Policy {policy_id} not found — skipping")
+            continue
+
+        query_id = policy_meta.get('queryId')
+        if not query_id:
+            null_query_policies.append(policy_id)
+            Logger.verbose(
+                f"[{i + 1}/{policy_count}] {policy_id}: "
+                f"no queryId (manual assessment)", verbose
+            )
+            continue
+
+        Logger.info(f"[{i + 1}/{policy_count}] Querying: {policy_id}")
+
+        violations = _execute_policy_query(query_id, env, verbose)
+
+        if violations:
+            acct_keys = set(_extract_account_key(v, cloud_type) for v in violations)
+            acct_keys.discard('')
+            Logger.verbose(
+                f"  {len(violations)} violations across "
+                f"{len(acct_keys)} accounts",
+                verbose
+            )
+        else:
+            Logger.verbose(f"  0 violations", verbose)
+
+        # Group violations by account key
+        for v in violations:
+            acct = _extract_account_key(v, cloud_type)
+            if not acct:
+                continue
+            if acct not in account_violations:
+                account_violations[acct] = {}
+            if policy_id not in account_violations[acct]:
+                account_violations[acct][policy_id] = []
+            account_violations[acct][policy_id].append(v)
+
+        # Delay between queries
+        if i < policy_count - 1:
+            time.sleep(CONFIG.REQUEST_DELAY)
+
+    # Log warnings for special cases
+    if null_query_policies:
+        Logger.info(
+            f"{len(null_query_policies)} policies have no queryId "
+            f"(manual assessments — shown as CouldNotAssess)"
+        )
+
+    # 5. Build per-account JSON files
+    report_time = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # All accounts: discovered + those found in query results
+    all_account_ids = set(accounts) | set(account_violations.keys())
+    Logger.info(
+        f"Building reports for {len(all_account_ids)} accounts "
+        f"({len(account_violations)} with violations)..."
+    )
+
+    success_count = 0
+    for account_id in sorted(all_account_ids):
+        recommendations = []
+        num_compliant = 0
+        num_non_compliant = 0
+        severity_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        total_violated_resources = 0
+
+        acct_viols = account_violations.get(account_id, {})
+
+        for policy_id in all_policy_ids:
+            policy_meta = all_policies.get(policy_id, {})
+            category = policy_section_map.get(policy_id, '')
+            violations_for_policy = acct_viols.get(policy_id, [])
+
+            rec = _build_recommendation_from_query(
+                policy_id, policy_meta, violations_for_policy,
+                account_id, category
+            )
+            recommendations.append(rec)
+
+            if rec['STATUS'] == 'NonCompliant':
+                num_non_compliant += 1
+                sev = policy_meta.get('severity', 5)
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+                total_violated_resources += rec['NUM_VIOLATIONS']
+            elif rec['STATUS'] == 'Compliant':
+                num_compliant += 1
+
+        summary = {
+            'NUM_RECOMMENDATIONS': len(recommendations),
+            'NUM_COMPLIANT': num_compliant,
+            'NUM_NOT_COMPLIANT': num_non_compliant,
+            'NUM_SEVERITY_1_NON_COMPLIANCE': severity_counts.get(1, 0),
+            'NUM_SEVERITY_2_NON_COMPLIANCE': severity_counts.get(2, 0),
+            'NUM_SEVERITY_3_NON_COMPLIANCE': severity_counts.get(3, 0),
+            'NUM_SEVERITY_4_NON_COMPLIANCE': severity_counts.get(4, 0),
+            'NUM_SEVERITY_5_NON_COMPLIANCE': severity_counts.get(5, 0),
+            'NUM_SUPPRESSED': 0,
+            'ASSESSED_RESOURCE_COUNT': 0,
+            'VIOLATED_RESOURCE_COUNT': total_violated_resources,
+            'SUPPRESSED_RESOURCE_COUNT': 0,
+        }
+
+        report_data = {
+            'reportTitle': report_name,
+            'reportType': 'COMPLIANCE',
+            'reportTime': report_time,
+            'accountId': account_id,
+            'recommendations': recommendations,
+            'summary': [summary]
+        }
+
+        safe_name = account_id.replace('/', '_').replace(':', '_')
+        output_file = os.path.join(report_output_dir, f"{safe_name}.json")
+        with open(output_file, 'w') as f:
+            json.dump(report_data, f, indent=2)
+
+        success_count += 1
+
+    Logger.info(
+        f"LQL fallback complete: {success_count} account reports generated"
+    )
+    return success_count, 0
+
+
+# ============================================================================
 # Excel Generation
 # ============================================================================
 
@@ -1120,6 +1502,161 @@ def _collect_violation_urns(recommendations: List[Dict]) -> List[str]:
     return list(urns)
 
 
+def _get_azure_parent_urn(urn: str) -> Optional[str]:
+    """Strip sub-resource path segments to get the parent Azure resource URN.
+
+    E.g. .../storageaccounts/foo/blobservices/default/containers/bar
+      -> .../storageaccounts/foo
+    """
+    lower = urn.lower()
+    idx = lower.find('/providers/')
+    if idx < 0:
+        return None
+    provider_path = urn[idx + len('/providers/'):]
+    parts = provider_path.split('/')
+    if len(parts) <= 3:
+        return None  # Already at parent level
+    return urn[:idx] + '/providers/' + '/'.join(parts[:3])
+
+
+def _fetch_azure_tags_via_lql(
+    urns: List[str],
+    env: Dict[str, str],
+    verbose: bool
+) -> Dict[str, Dict]:
+    """
+    Fetch Azure resource tags via the LW_CFG_AZURE_ALL LQL datasource.
+
+    The Inventory API (/api/v2/Inventory/search) returns empty for Azure,
+    so we query LQL directly via POST /api/v2/Queries/execute, partitioned
+    by subscription ID to stay under the 5000-row query cap.
+
+    Returns {urn: {tag_key: tag_value}} for resources with non-empty tags.
+    Includes parent-URN fallback for sub-resources (e.g. blob containers
+    inherit tags from their parent storage account).
+    """
+    # Extract unique subscription IDs from violation URNs
+    sub_ids = set()
+    for urn in urns:
+        match = re.search(r'/subscriptions/([^/]+)/', urn, re.IGNORECASE)
+        if match:
+            sub_ids.add(match.group(1).lower())
+
+    if not sub_ids:
+        Logger.warning("No subscription IDs found in Azure violation URNs")
+        return {}
+
+    Logger.info(
+        f"Fetching Azure tags via LQL (LW_CFG_AZURE_ALL) "
+        f"for {len(sub_ids)} subscriptions..."
+    )
+
+    # Time range: last 7 days
+    now = datetime.datetime.utcnow()
+    end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    start_time = (now - datetime.timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # Build tag lookup keyed by lowercase URN
+    raw_lookup: Dict[str, Dict] = {}  # lowercase_urn -> tags
+    total_tagged = 0
+
+    for i, sub_id in enumerate(sorted(sub_ids)):
+        query_text = (
+            f"{{ source {{ LW_CFG_AZURE_ALL r }} "
+            f"filter {{ r.URN LIKE '/subscriptions/{sub_id}/%' "
+            f"AND r.RESOURCE_TAGS <> '{{}}' "
+            f"AND r.RESOURCE_TAGS is not null }} "
+            f"return distinct {{ r.URN, r.RESOURCE_TAGS }} }}"
+        )
+
+        payload = json.dumps({
+            "query": {"queryText": query_text},
+            "arguments": [
+                {"name": "StartTimeRange", "value": start_time},
+                {"name": "EndTimeRange", "value": end_time}
+            ]
+        })
+
+        cmd = [
+            'lacework', 'api', 'post', 'api/v2/Queries/execute',
+            '-d', payload, '--json', '--noninteractive'
+        ]
+
+        try:
+            output, was_rate_limited = make_api_call(cmd, env, verbose)
+
+            if was_rate_limited:
+                Logger.warning(
+                    f"Rate-limited on subscription {i + 1}/{len(sub_ids)} "
+                    f"({sub_id}) — skipping"
+                )
+                continue
+
+            if not output:
+                Logger.verbose(
+                    f"  Subscription {i + 1}/{len(sub_ids)} ({sub_id}): "
+                    f"empty response", verbose
+                )
+                continue
+
+            response = json.loads(output)
+            data = response.get('data', []) if isinstance(response, dict) else []
+
+            for item in data:
+                urn_val = item.get('URN', '')
+                tags = item.get('RESOURCE_TAGS')
+                if urn_val and tags and isinstance(tags, dict):
+                    urn_lower = urn_val.lower()
+                    if urn_lower not in raw_lookup:
+                        raw_lookup[urn_lower] = tags
+
+            Logger.info(
+                f"  Subscription {i + 1}/{len(sub_ids)} ({sub_id}): "
+                f"{len(data)} tagged resources"
+            )
+            total_tagged += len(data)
+
+        except (json.JSONDecodeError, ValueError) as e:
+            Logger.warning(
+                f"Failed to parse LQL response for subscription "
+                f"{sub_id}: {e}"
+            )
+        except Exception as e:
+            Logger.warning(
+                f"Error fetching LQL tags for subscription {sub_id}: {e}"
+            )
+
+        # Delay between subscription queries
+        if i < len(sub_ids) - 1:
+            time.sleep(CONFIG.TAG_FETCH_DELAY)
+
+    Logger.info(
+        f"Azure tag lookup: {len(raw_lookup)} unique tagged resources "
+        f"across {len(sub_ids)} subscriptions"
+    )
+
+    # Match violation URNs to tags (case-insensitive, with parent fallback)
+    tags_lookup: Dict[str, Dict] = {}
+    parent_matches = 0
+
+    for urn in urns:
+        urn_lower = urn.lower()
+        if urn_lower in raw_lookup:
+            tags_lookup[urn] = raw_lookup[urn_lower]
+        else:
+            parent = _get_azure_parent_urn(urn)
+            if parent and parent.lower() in raw_lookup:
+                tags_lookup[urn] = raw_lookup[parent.lower()]
+                parent_matches += 1
+
+    Logger.info(
+        f"Matched tags for {len(tags_lookup)}/{len(urns)} violation resources"
+        + (f" ({parent_matches} via parent fallback)" if parent_matches else "")
+    )
+
+    return tags_lookup
+
+
 def _fetch_inventory_tags(
     urns: List[str],
     cloud_type: CloudType,
@@ -1132,10 +1669,16 @@ def _fetch_inventory_tags(
     Calls POST /api/v2/Inventory/search with URN filters in batches of 100.
     Returns {urn: {tag_key: tag_value}} for resources with non-empty tags.
     On error, warns and returns partial results (never fails the report).
+
+    Azure uses a separate LQL-based path since the Inventory API returns
+    empty results for Azure resources.
     """
+    # Azure: route to LQL-based tag fetching
+    if cloud_type == CloudType.AZURE:
+        return _fetch_azure_tags_via_lql(urns, env, verbose)
+
     csp_map = {
         CloudType.AWS: 'AWS',
-        CloudType.AZURE: 'Azure',
         CloudType.GCP: 'GCP',
     }
     csp = csp_map.get(cloud_type)
@@ -1739,6 +2282,8 @@ For custom frameworks, specify --cloud-type explicitly:
     parser.add_argument('--skip-tags', action='store_true',
                         help='Skip fetching resource tags from inventory API')
     parser.add_argument('--investigate-account', help='Investigate "Could Not Assess" issues for a specific account ID')
+    parser.add_argument('--use-reports-api', action='store_true',
+                        help='Use the /api/v2/Reports endpoint instead of LQL queries (legacy; Reports API may return 500)')
     
     args = parser.parse_args()
     
@@ -1790,37 +2335,44 @@ For custom frameworks, specify --cloud-type explicitly:
     os.makedirs(report_output_dir, exist_ok=True)
     Logger.info(f"Output directory: {report_output_dir}")
     
-    # Fetch report for each account
-    success_count = 0
-    failure_count = 0
-    
-    for account_num, account in enumerate(accounts, 1):
-        Logger.info(f"[{account_num}/{account_count}] Processing account: {account}")
+    # Fetch reports
+    if args.use_reports_api:
+        # Legacy path: fetch report per account via /api/v2/Reports
+        Logger.info("Using Reports API (--use-reports-api)")
+        success_count = 0
+        failure_count = 0
 
-        # Sanitize account name for filename
-        safe_account_name = account.replace('/', '_').replace(':', '_')
-        output_file = os.path.join(report_output_dir, f"{safe_account_name}.json")
+        for account_num, account in enumerate(accounts, 1):
+            Logger.info(f"[{account_num}/{account_count}] Processing account: {account}")
 
-        if get_report_for_account(cloud_type, args.report_name, account, output_file, env, args.verbose):
-            success_count += 1
-        else:
-            failure_count += 1
-            Logger.warning(f"Failed to get report for account: {account}")
-            # Fail fast: if the first account returns no data, the report name is likely wrong
-            if account_num == 1:
-                Logger.error(
-                    f"First account returned no data. Report name '{args.report_name}' "
-                    "may not exist. Please verify the report name and try again."
-                )
-                sys.exit(1)
-        
-        # Small delay between requests
-        time.sleep(CONFIG.REQUEST_DELAY)
-    
+            safe_account_name = account.replace('/', '_').replace(':', '_')
+            output_file = os.path.join(report_output_dir, f"{safe_account_name}.json")
+
+            if get_report_for_account(cloud_type, args.report_name, account, output_file, env, args.verbose):
+                success_count += 1
+            else:
+                failure_count += 1
+                Logger.warning(f"Failed to get report for account: {account}")
+                if account_num == 1:
+                    Logger.error(
+                        f"First account returned no data. Report name '{args.report_name}' "
+                        "may not exist. The Reports API may be returning 500 errors — "
+                        "try without --use-reports-api to use LQL queries instead."
+                    )
+                    sys.exit(1)
+
+            time.sleep(CONFIG.REQUEST_DELAY)
+    else:
+        # Default: execute individual LQL policy queries
+        success_count, failure_count = _fetch_reports_via_lql(
+            args.report_name, cloud_type, accounts,
+            report_output_dir, env, args.verbose, args.test
+        )
+
     # Summary
     print()
     Logger.info("Summary:")
-    Logger.info(f"  Total accounts: {account_count}")
+    Logger.info(f"  Total accounts: {len(accounts) if args.use_reports_api else success_count}")
     Logger.info(f"  Successful: {success_count}")
     Logger.info(f"  Failed: {failure_count}")
     if args.no_concatenate:
