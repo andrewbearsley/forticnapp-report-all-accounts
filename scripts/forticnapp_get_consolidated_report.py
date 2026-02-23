@@ -133,8 +133,8 @@ class Config:
             self.SUMMARY_FIELDS = self.RECOMMENDATIONS_FIELDS + self.POLICY_FIELDS + self.RESOURCE_FIELDS
         if self.EXCEL_HEADERS is None:
             self.EXCEL_HEADERS = [
-                'Section', 'Service', 'Policy', 'Link', 'Severity', 'Account', 'Status',
-                'Resource', 'Tags', 'Remediation'
+                'Section', 'Policy', 'Severity', 'Account', 'Status',
+                'Resource', 'Remediation', 'Tags'
             ]
 
 
@@ -1154,12 +1154,12 @@ def _fetch_reports_via_lql(
     Logger.info(f"Loaded metadata for {len(all_policies)} policies")
 
     # 3. Extract policy IDs from sections
-    policy_section_map: Dict[str, str] = {}  # {policy_id: category}
+    policy_section_map: Dict[str, str] = {}  # {policy_id: section_title}
     all_policy_ids: List[str] = []
     for section in sections:
-        category = section.get('category', section.get('title', ''))
+        section_title = section.get('title', section.get('category', ''))
         for pid in section.get('policies', []):
-            policy_section_map[pid] = category
+            policy_section_map[pid] = section_title
             all_policy_ids.append(pid)
 
     Logger.info(
@@ -1352,121 +1352,125 @@ def create_excel_from_report(data: Dict, output_file: str, include_compliant: bo
 
 
 def _create_summary_sheet(wb: Workbook, data: Dict) -> None:
-    """Create Summary sheet in workbook."""
+    """Create Summary sheet with overview and non-compliant policy breakdown."""
     ws = wb.create_sheet("Summary", 0)
     summary = data['summary'][0]
-    
-    # Calculate percentages
-    total_policies = summary.get('NUM_RECOMMENDATIONS', 0)
-    non_compliant_policies = summary.get('NUM_NOT_COMPLIANT', 0)
-    policy_non_compliant_pct = (non_compliant_policies / total_policies * 100) if total_policies > 0 else 0
-    
-    assessed_resources = summary.get('ASSESSED_RESOURCE_COUNT', 0)
-    violated_resources = summary.get('VIOLATED_RESOURCE_COUNT', 0)
-    resource_violated_pct = (violated_resources / assessed_resources * 100) if assessed_resources > 0 else 0
-    
-    # Count "Could Not Assess" policies from recommendations
     recommendations = data.get('recommendations', [])
-    could_not_assess_count = sum(1 for rec in recommendations if rec.get('STATUS', '').upper() == 'COULDNOTASSESS')
-    
-    # Analyze which accounts have "Could Not Assess" issues
-    could_not_assess_by_account = {}
-    for rec in recommendations:
-        if rec.get('STATUS', '').upper() == 'COULDNOTASSESS':
-            account_id = rec.get('ACCOUNT_ID', 'Unknown')
-            could_not_assess_by_account[account_id] = could_not_assess_by_account.get(account_id, 0) + 1
-    
-    # Header section - vibrant design
+
+    # Calculate overview stats
+    total_policies = summary.get('NUM_RECOMMENDATIONS', 0)
+    non_compliant_count = summary.get('NUM_NOT_COMPLIANT', 0)
+    compliant_count = summary.get('NUM_COMPLIANT', 0)
+    could_not_assess_count = sum(
+        1 for rec in recommendations
+        if rec.get('STATUS', '').upper() == 'COULDNOTASSESS'
+    )
+    non_compliant_pct = (
+        (non_compliant_count / total_policies * 100) if total_policies > 0 else 0
+    )
+
+    # Unique accounts
+    all_accounts = set(rec.get('ACCOUNT_ID', '') for rec in recommendations)
+    all_accounts.discard('')
+
+    # Header
     ws['A1'] = data['reportTitle']
     ws['A1'].font = Font(bold=True, size=16, color="1A1A1A")
-    ws['A2'] = f"Report Type: {data['reportType']}"
+    ws['A2'] = f"Report Time: {data['reportTime']}"
     ws['A2'].font = Font(size=10, color="333333")
-    ws['A3'] = f"Report Time: {data['reportTime']}"
-    ws['A3'].font = Font(size=10, color="333333")
-    
-    # Spacing
-    row = 5
-    
-    # Policies Section
+
+    # Overview metrics
+    row = 4
+    _add_section_header(ws, row, 'Overview', num_cols=3)
     row += 1
-    _add_section_header(ws, row, 'Policies')
+    _add_metric_row(ws, row, 'Total Accounts', len(all_accounts))
     row += 1
-    # 1. Non-Compliant % (right-aligned)
-    _add_metric_row(ws, row, 'Non-Compliant %', f"{policy_non_compliant_pct:.1f}%", right_align=True)
-    row += 1
-    # 2. Non-Compliant
-    _add_metric_row(ws, row, 'Non-Compliant', non_compliant_policies)
-    row += 1
-    # 3. Compliant
-    compliant_policies = summary.get('NUM_COMPLIANT', 0)
-    _add_metric_row(ws, row, 'Compliant', compliant_policies)
-    row += 1
-    # 4. Requires Manual Assessment (Could Not Assess)
-    _add_metric_row(ws, row, 'Requires Manual Assessment', could_not_assess_count)
-    row += 1
-    # Show accounts with most "Could Not Assess" issues if any exist
-    if could_not_assess_count > 0 and could_not_assess_by_account:
-        top_accounts = sorted(could_not_assess_by_account.items(), key=lambda x: x[1], reverse=True)[:5]
-        accounts_list = ', '.join([f"{acc}({count})" for acc, count in top_accounts])
-        if len(could_not_assess_by_account) > 5:
-            accounts_list += f" (+{len(could_not_assess_by_account) - 5} more)"
-        _add_metric_row(ws, row, '  Top affected accounts', accounts_list)
-        row += 1
-    # 5. Total Policies
-    total_policies = summary.get('NUM_RECOMMENDATIONS', 0)
     _add_metric_row(ws, row, 'Total Policies', total_policies)
     row += 1
-    
-    # Resources Section
+    _add_metric_row(ws, row, 'Non-Compliant', f"{non_compliant_count} ({non_compliant_pct:.1f}%)")
     row += 1
-    _add_section_header(ws, row, 'Resources')
+    _add_metric_row(ws, row, 'Compliant', compliant_count)
     row += 1
-    # 1. Violated % (right-aligned)
-    _add_metric_row(ws, row, 'Violated %', f"{resource_violated_pct:.1f}%", right_align=True)
+    _add_metric_row(ws, row, 'Could Not Assess', could_not_assess_count)
+
+    # Build per-policy stats: {policy_title: {severity, non_compliant_accounts, compliant_accounts}}
+    policy_stats: Dict[str, Dict] = {}
+    for rec in recommendations:
+        title = rec.get('TITLE', '')
+        if not title:
+            continue
+        if title not in policy_stats:
+            policy_stats[title] = {
+                'severity': rec.get('SEVERITY', 5),
+                'rec_id': rec.get('REC_ID', ''),
+                'non_compliant': set(),
+                'compliant': set(),
+            }
+        acct = rec.get('ACCOUNT_ID', '')
+        status = rec.get('STATUS', '').upper()
+        if status == 'NONCOMPLIANT':
+            policy_stats[title]['non_compliant'].add(acct)
+        elif status == 'COMPLIANT':
+            policy_stats[title]['compliant'].add(acct)
+
+    # Filter to non-compliant policies, sort by severity then non-compliant count
+    nc_policies = [
+        (title, stats) for title, stats in policy_stats.items()
+        if stats['non_compliant']
+    ]
+    nc_policies.sort(key=lambda x: (x[1]['severity'], -len(x[1]['non_compliant'])))
+
+    # Non-Compliant Policies table
+    row += 2
+    _add_section_header(ws, row, 'Non-Compliant Policies', num_cols=3)
     row += 1
-    # 2. Violated
-    _add_metric_row(ws, row, 'Violated', violated_resources)
+
+    # Table header
+    table_headers = ['Policy', 'Severity', 'Non-Compliant Accounts', 'Compliant Accounts']
+    header_font = Font(bold=True, size=10, color="FFFFFF")
+    header_fill = PatternFill(start_color="2D3748", end_color="2D3748", fill_type="solid")
+    for col, hdr in enumerate(table_headers, 1):
+        cell = ws.cell(row=row, column=col, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
     row += 1
-    # 3. Assessed
-    assessed_resources = summary.get('ASSESSED_RESOURCE_COUNT', 0)
-    _add_metric_row(ws, row, 'Assessed', assessed_resources)
-    row += 1
-    # 4. Suppressed
-    suppressed_resources = summary.get('SUPPRESSED_RESOURCE_COUNT', 0)
-    _add_metric_row(ws, row, 'Suppressed', suppressed_resources)
-    row += 1
-    
+
+    # Table rows
+    for title, stats in nc_policies:
+        sev_label = CONFIG.SEVERITY_MAP.get(stats['severity'], 'Unknown')
+        nc_count = len(stats['non_compliant'])
+        c_count = len(stats['compliant'])
+
+        ws.cell(row=row, column=1, value=title)
+        ws.cell(row=row, column=2, value=sev_label)
+        ws.cell(row=row, column=3, value=nc_count)
+        ws.cell(row=row, column=4, value=c_count)
+
+        # Color severity
+        sev_colors = {1: 'DC2626', 2: 'EA580C', 3: 'D97706', 4: '2563EB', 5: '6B7280'}
+        sev_color = sev_colors.get(stats['severity'], '6B7280')
+        ws.cell(row=row, column=2).font = Font(size=10, color=sev_color)
+        row += 1
+
     # Column widths
-    ws.column_dimensions['A'].width = 35
-    ws.column_dimensions['B'].width = 25
-    
-    # Add notes at bottom
-    note_row = row + 2
-    note_cell = ws[f'A{note_row}']
-    note_cell.value = "Note: Policy counts refer to compliance policies/checks. Resource counts refer to actual cloud resources assessed."
-    note_cell.font = Font(italic=True, size=8, color="666666")
-    note_cell.alignment = Alignment(wrap_text=True, vertical='top')
-    ws.merge_cells(f'A{note_row}:B{note_row}')
-    ws.row_dimensions[note_row].height = 25
-    
-    # Add note about "Could Not Assess" if applicable
-    if could_not_assess_count > 0:
-        note_row += 1
-        cna_note_cell = ws[f'A{note_row}']
-        cna_note_cell.value = "Could Not Assess: Compliance checks that could not be performed, often due to missing IAM permissions, services not enabled, or resources not available. Check account configuration and Lacework integration."
-        cna_note_cell.font = Font(italic=True, size=8, color="D97706")
-        cna_note_cell.alignment = Alignment(wrap_text=True, vertical='top')
-        ws.merge_cells(f'A{note_row}:B{note_row}')
-        ws.row_dimensions[note_row].height = 30
+    ws.column_dimensions['A'].width = 60
+    ws.column_dimensions['B'].width = 15
+    ws.column_dimensions['C'].width = 25
+    ws.column_dimensions['D'].width = 25
 
 
-def _add_section_header(ws, row: int, title: str) -> None:
+def _add_section_header(ws, row: int, title: str, num_cols: int = 2) -> None:
     """Add a section header with vibrant styling."""
     header_cell = ws[f'A{row}']
     header_cell.value = title
     header_cell.font = Font(bold=True, size=12, color="FFFFFF")
-    header_cell.fill = PatternFill(start_color="4A5568", end_color="4A5568", fill_type="solid")
-    ws.merge_cells(f'A{row}:B{row}')
+    header_fill = PatternFill(start_color="4A5568", end_color="4A5568", fill_type="solid")
+    header_cell.fill = header_fill
+    end_col = get_column_letter(max(num_cols, 2))
+    ws.merge_cells(f'A{row}:{end_col}{row}')
+    # Apply fill to all merged cells
+    for col in range(2, max(num_cols, 2) + 1):
+        ws.cell(row=row, column=col).fill = header_fill
     ws.row_dimensions[row].height = 24
     header_cell.alignment = Alignment(horizontal='left', vertical='center')
 
@@ -1798,13 +1802,11 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
         # Base row data shared across all expanded rows for this recommendation
         base = {
             'CATEGORY': rec.get('CATEGORY', ''),
-            'SERVICE': rec.get('SERVICE', ''),
             'TITLE': rec.get('TITLE', ''),
             'REC_ID': rec.get('REC_ID', ''),
             'SEVERITY': rec.get('SEVERITY', ''),
             'ACCOUNT_ID': rec.get('ACCOUNT_ID', ''),
             'STATUS': status,
-            'REMEDIATION': rec.get('REMEDIATION', ''),
         }
 
         if violations:
@@ -1897,37 +1899,38 @@ def _write_excel_headers(ws, headers: List[str]) -> None:
 
 def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     """Write a single recommendation row to Excel worksheet."""
-    # Column mapping: Section, Service, Policy, Link, Severity, Account, Status,
-    # Resource, Tags
+    # Column mapping: Section, Policy, Severity, Account, Status,
+    # Resource, Remediation, Tags
     ws.cell(row=row_num, column=1, value=rec.get('CATEGORY', ''))
-    ws.cell(row=row_num, column=2, value=rec.get('SERVICE', ''))
-    ws.cell(row=row_num, column=3, value=rec.get('TITLE', ''))
+    ws.cell(row=row_num, column=2, value=rec.get('TITLE', ''))
 
-    # REC_ID as hyperlink
+    # Severity as label
+    severity = rec.get('SEVERITY', '')
+    ws.cell(row=row_num, column=3, value=CONFIG.SEVERITY_MAP.get(severity, f'Unknown ({severity})'))
+
+    ws.cell(row=row_num, column=4, value=rec.get('ACCOUNT_ID', ''))
+
+    # Format status for readability
+    status = rec.get('STATUS', '')
+    ws.cell(row=row_num, column=5, value=_format_status(status))
+
+    # Individual resource
+    ws.cell(row=row_num, column=6, value=rec.get('RESOURCE', ''))
+
+    # Remediation as hyperlink to Fortinet docs
     rec_id = rec.get('REC_ID', '')
     if rec_id:
         rec_id_upper = rec_id.upper().replace('-', '_')
         url = f"https://docs.fortinet.com/document/lacework-forticnapp/latest/lacework-forticnapp-policies?cshid={rec_id_upper}"
-        cell = ws.cell(row=row_num, column=4)
+        cell = ws.cell(row=row_num, column=7)
         cell.value = rec_id
         cell.hyperlink = url
         cell.font = Font(color=CONFIG.EXCEL_LINK_COLOR, underline="single")
     else:
-        ws.cell(row=row_num, column=4, value='')
+        ws.cell(row=row_num, column=7, value='')
 
-    # Severity as label
-    severity = rec.get('SEVERITY', '')
-    ws.cell(row=row_num, column=5, value=CONFIG.SEVERITY_MAP.get(severity, f'Unknown ({severity})'))
-
-    ws.cell(row=row_num, column=6, value=rec.get('ACCOUNT_ID', ''))
-    # Format status for readability
-    status = rec.get('STATUS', '')
-    ws.cell(row=row_num, column=7, value=_format_status(status))
-
-    # Individual resource and tags (from expanded row)
-    ws.cell(row=row_num, column=8, value=rec.get('RESOURCE', ''))
-    ws.cell(row=row_num, column=9, value=rec.get('TAGS', ''))
-    ws.cell(row=row_num, column=10, value=rec.get('REMEDIATION', ''))
+    # Tags
+    ws.cell(row=row_num, column=8, value=rec.get('TAGS', ''))
 
 
 def _format_status(status: str) -> str:
