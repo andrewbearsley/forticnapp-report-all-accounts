@@ -1124,7 +1124,7 @@ def _fetch_reports_via_lql(
     env: Dict[str, str],
     verbose: bool,
     test_mode: bool = False
-) -> Tuple[int, int]:
+) -> Optional[Tuple[int, int]]:
     """
     Fetch compliance report via individual LQL policy queries.
 
@@ -1132,17 +1132,14 @@ def _fetch_reports_via_lql(
     policy's underlying query, groups violations by account, and writes
     per-account JSON files in the same format as get_report_for_account().
 
-    Returns (success_count, failure_count).
+    Returns (success_count, failure_count), or None if the report definition
+    is not found (caller should fall back to Reports API).
     """
     # 1. Fetch report definition
-    Logger.info(f"Fetching report definition for '{report_name}'...")
+    Logger.verbose(f"Fetching report definition for '{report_name}'...", verbose)
     report_def = _fetch_report_definition(report_name, env, verbose)
     if not report_def:
-        Logger.error(
-            f"Report definition '{report_name}' not found. "
-            "Check the name with: lacework report-definitions list"
-        )
-        sys.exit(1)
+        return None  # Signal caller to fall back to Reports API
 
     sections = report_def.get('reportDefinition', {}).get('sections', [])
     if not sections:
@@ -2355,9 +2352,23 @@ For custom frameworks, specify --cloud-type explicitly:
     Logger.info(f"Output directory: {report_output_dir}")
     
     # Fetch reports
-    if args.use_reports_api:
-        # Legacy path: fetch report per account via /api/v2/Reports
-        Logger.info("Using Reports API (--use-reports-api)")
+    use_reports_api = args.use_reports_api
+
+    if not use_reports_api:
+        # Default: try LQL policy queries first
+        result = _fetch_reports_via_lql(
+            args.report_name, cloud_type, accounts,
+            report_output_dir, env, args.verbose, args.test
+        )
+        if result is None:
+            # Report definition not found — silently fall back to Reports API
+            use_reports_api = True
+        else:
+            success_count, failure_count = result
+
+    if use_reports_api:
+        # Fetch report per account via /api/v2/Reports
+        Logger.verbose("Using Reports API", args.verbose)
         success_count = 0
         failure_count = 0
 
@@ -2375,23 +2386,16 @@ For custom frameworks, specify --cloud-type explicitly:
                 if account_num == 1:
                     Logger.error(
                         f"First account returned no data. Report name '{args.report_name}' "
-                        "may not exist. The Reports API may be returning 500 errors — "
-                        "try without --use-reports-api to use LQL queries instead."
+                        "may not exist."
                     )
                     sys.exit(1)
 
             time.sleep(CONFIG.REQUEST_DELAY)
-    else:
-        # Default: execute individual LQL policy queries
-        success_count, failure_count = _fetch_reports_via_lql(
-            args.report_name, cloud_type, accounts,
-            report_output_dir, env, args.verbose, args.test
-        )
 
     # Summary
     print()
     Logger.info("Summary:")
-    Logger.info(f"  Total accounts: {len(accounts) if args.use_reports_api else success_count}")
+    Logger.info(f"  Total accounts: {len(accounts) if use_reports_api else success_count}")
     Logger.info(f"  Successful: {success_count}")
     Logger.info(f"  Failed: {failure_count}")
     if args.no_concatenate:
