@@ -5,6 +5,7 @@ Usage: python3 forticnapp_get_consolidated_report.py <api-key-path> <report-name
 """
 
 import argparse
+import csv
 import datetime
 import json
 import os
@@ -58,6 +59,7 @@ class Config:
     
     # Directories
     CACHE_DIR: str = 'cache'
+    HISTORY_DIR: str = 'history'
     OUTPUT_DIR: str = 'output'
     
     # Default output files
@@ -137,7 +139,7 @@ class Config:
         if self.EXCEL_HEADERS is None:
             self.EXCEL_HEADERS = [
                 'Section', 'Policy', 'Severity', 'Account', 'Account Name',
-                'Status', 'Resource', 'Remediation', 'Docs', 'Tags'
+                'Status', 'Resource', 'First Seen', 'Remediation', 'Docs', 'Tags'
             ]
 
 
@@ -1781,6 +1783,78 @@ def _fetch_inventory_tags(
     return tags_lookup
 
 
+# ============================================================================
+# Violation History Tracking
+# ============================================================================
+
+def _get_history_path(report_name: str) -> str:
+    """Get the CSV history file path for a report."""
+    safe_name = report_name.replace('/', '_').replace('\\', '_').replace('..', '_')
+    return os.path.join(CONFIG.HISTORY_DIR, f"{safe_name}.csv")
+
+
+def _load_violation_history(report_name: str) -> Dict[tuple, str]:
+    """Load violation history from CSV. Returns {(policy_id, account_id, resource): first_seen_date}."""
+    path = _get_history_path(report_name)
+    history = {}
+    if not os.path.exists(path):
+        return history
+    with open(path, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = (row.get('policy_id', ''), row.get('account_id', ''), row.get('resource', ''))
+            history[key] = row.get('first_seen', '')
+    return history
+
+
+def _save_violation_history(report_name: str, history: Dict[tuple, str]) -> None:
+    """Save violation history to CSV."""
+    os.makedirs(CONFIG.HISTORY_DIR, exist_ok=True)
+    path = _get_history_path(report_name)
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['policy_id', 'account_id', 'resource', 'first_seen'])
+        writer.writeheader()
+        for (policy_id, account_id, resource), first_seen in sorted(history.items()):
+            writer.writerow({
+                'policy_id': policy_id,
+                'account_id': account_id,
+                'resource': resource,
+                'first_seen': first_seen,
+            })
+
+
+def _enrich_with_first_seen(
+    recommendations: List[Dict],
+    report_name: str,
+    verbose: bool
+) -> None:
+    """Enrich violations with first-seen dates from history.
+
+    Loads existing history, sets first_seen on each violation, records new
+    violations with today's date, and saves updated history.
+    """
+    history = _load_violation_history(report_name)
+    today = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
+    new_count = 0
+
+    for rec in recommendations:
+        rec_id = rec.get('REC_ID', '')
+        account_id = rec.get('ACCOUNT_ID', '')
+        for v in rec.get('VIOLATIONS', []):
+            resource = v.get('resource', '')
+            key = (rec_id, account_id, resource)
+            if key not in history:
+                history[key] = today
+                new_count += 1
+            v['first_seen'] = history[key]
+
+    _save_violation_history(report_name, history)
+
+    total = len(history)
+    Logger.info(f"Violation history: {total} tracked, {new_count} new today")
+    Logger.verbose(f"History file: {_get_history_path(report_name)}", verbose)
+
+
 def _expand_recommendations_to_rows(recommendations: List[Dict], include_compliant: bool = False, tags_lookup: Dict = None) -> List[Dict]:
     """
     Expand recommendations so each violation gets its own row.
@@ -1817,6 +1891,7 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
                 row = dict(base)
                 resource = v.get('resource', '')
                 row['RESOURCE'] = resource
+                row['FIRST_SEEN'] = v.get('first_seen', '')
                 # Prefer tags from inventory lookup, fall back to inline tags
                 tags = (tags_lookup.get(resource, {}) if tags_lookup else {}) or v.get('resourceTags') or v.get('tags') or {}
                 row['TAGS'] = json.dumps(tags) if tags else ''
@@ -1824,6 +1899,7 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
         else:
             row = dict(base)
             row['RESOURCE'] = ''
+            row['FIRST_SEEN'] = ''
             row['TAGS'] = ''
             rows.append(row)
 
@@ -1903,7 +1979,7 @@ def _write_excel_headers(ws, headers: List[str]) -> None:
 def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     """Write a single recommendation row to Excel worksheet."""
     # Column mapping: Section, Policy, Severity, Account, Account Name,
-    # Status, Resource, Remediation, Tags
+    # Status, Resource, First Seen, Remediation, Docs, Tags
     ws.cell(row=row_num, column=1, value=rec.get('CATEGORY', ''))
     ws.cell(row=row_num, column=2, value=rec.get('TITLE', ''))
 
@@ -1921,23 +1997,26 @@ def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     # Individual resource
     ws.cell(row=row_num, column=7, value=rec.get('RESOURCE', ''))
 
+    # First Seen date
+    ws.cell(row=row_num, column=8, value=rec.get('FIRST_SEEN', ''))
+
     # Remediation text
-    ws.cell(row=row_num, column=8, value=rec.get('REMEDIATION', ''))
+    ws.cell(row=row_num, column=9, value=rec.get('REMEDIATION', ''))
 
     # Docs: hyperlink to Fortinet docs with policy ID as link text
     rec_id = rec.get('REC_ID', '')
     if rec_id:
         rec_id_upper = rec_id.upper().replace('-', '_')
         url = CONFIG.POLICY_DOCS_URL.format(policy_id=rec_id_upper)
-        cell = ws.cell(row=row_num, column=9)
+        cell = ws.cell(row=row_num, column=10)
         cell.value = rec_id
         cell.hyperlink = url
         cell.font = Font(color=CONFIG.EXCEL_LINK_COLOR, underline="single")
     else:
-        ws.cell(row=row_num, column=9, value='')
+        ws.cell(row=row_num, column=10, value='')
 
     # Tags
-    ws.cell(row=row_num, column=10, value=rec.get('TAGS', ''))
+    ws.cell(row=row_num, column=11, value=rec.get('TAGS', ''))
 
 
 def _format_status(status: str) -> str:
@@ -1985,7 +2064,8 @@ def concatenate_reports(
     include_compliant: bool = False,
     env: Dict[str, str] = None,
     cloud_type: CloudType = None,
-    skip_tags: bool = False
+    skip_tags: bool = False,
+    report_name: str = ''
 ) -> str:
     """Concatenate individual report files into a single consolidated report."""
     Logger.verbose("Collecting recommendations from all accounts...", verbose)
@@ -2028,6 +2108,10 @@ def concatenate_reports(
             Logger.info(f"Retrieved tags for {len(tags_lookup)} resources")
         else:
             Logger.verbose("No ARN resources found in violations, skipping tag fetch", verbose)
+
+    # Enrich violations with first-seen dates from history
+    if report_name and output_format != OutputFormat.JSON:
+        _enrich_with_first_seen(all_recommendations, report_name, verbose)
 
     Logger.verbose("Calculating overall summary...", verbose)
     summary = _calculate_aggregate_summary(report_files)
@@ -2429,7 +2513,7 @@ For custom frameworks, specify --cloud-type explicitly:
         try:
             concatenate_reports(report_output_dir, output_format, args.output, args.verbose,
                                 args.include_compliant, env=env, cloud_type=cloud_type,
-                                skip_tags=args.skip_tags)
+                                skip_tags=args.skip_tags, report_name=args.report_name)
             Logger.verbose("Successfully created concatenated report", args.verbose)
             
             # Load consolidated data for investigation if needed (before cleanup)

@@ -13,8 +13,9 @@ output/
 *.xls
 *.xlsx
 
-# Cache directories
+# Cache and history directories
 cache/
+history/
 __pycache__/
 *.pyc
 *.pyo
