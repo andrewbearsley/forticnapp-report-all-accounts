@@ -136,8 +136,8 @@ class Config:
             self.SUMMARY_FIELDS = self.RECOMMENDATIONS_FIELDS + self.POLICY_FIELDS + self.RESOURCE_FIELDS
         if self.EXCEL_HEADERS is None:
             self.EXCEL_HEADERS = [
-                'Section', 'Policy', 'Severity', 'Account', 'Status',
-                'Resource', 'Remediation', 'Tags'
+                'Section', 'Policy', 'Severity', 'Account', 'Account Name',
+                'Status', 'Resource', 'Remediation', 'Docs', 'Tags'
             ]
 
 
@@ -1807,7 +1807,9 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
             'REC_ID': rec.get('REC_ID', ''),
             'SEVERITY': rec.get('SEVERITY', ''),
             'ACCOUNT_ID': rec.get('ACCOUNT_ID', ''),
+            'ACCOUNT_ALIAS': rec.get('ACCOUNT_ALIAS', ''),
             'STATUS': status,
+            'REMEDIATION': rec.get('REMEDIATION', ''),
         }
 
         if violations:
@@ -1900,8 +1902,8 @@ def _write_excel_headers(ws, headers: List[str]) -> None:
 
 def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     """Write a single recommendation row to Excel worksheet."""
-    # Column mapping: Section, Policy, Severity, Account, Status,
-    # Resource, Remediation, Tags
+    # Column mapping: Section, Policy, Severity, Account, Account Name,
+    # Status, Resource, Remediation, Tags
     ws.cell(row=row_num, column=1, value=rec.get('CATEGORY', ''))
     ws.cell(row=row_num, column=2, value=rec.get('TITLE', ''))
 
@@ -1910,28 +1912,32 @@ def _write_recommendation_row(ws, row_num: int, rec: Dict) -> None:
     ws.cell(row=row_num, column=3, value=CONFIG.SEVERITY_MAP.get(severity, f'Unknown ({severity})'))
 
     ws.cell(row=row_num, column=4, value=rec.get('ACCOUNT_ID', ''))
+    ws.cell(row=row_num, column=5, value=rec.get('ACCOUNT_ALIAS', ''))
 
     # Format status for readability
     status = rec.get('STATUS', '')
-    ws.cell(row=row_num, column=5, value=_format_status(status))
+    ws.cell(row=row_num, column=6, value=_format_status(status))
 
     # Individual resource
-    ws.cell(row=row_num, column=6, value=rec.get('RESOURCE', ''))
+    ws.cell(row=row_num, column=7, value=rec.get('RESOURCE', ''))
 
-    # Remediation as hyperlink to Fortinet docs
+    # Remediation text
+    ws.cell(row=row_num, column=8, value=rec.get('REMEDIATION', ''))
+
+    # Docs: hyperlink to Fortinet docs with policy ID as link text
     rec_id = rec.get('REC_ID', '')
     if rec_id:
         rec_id_upper = rec_id.upper().replace('-', '_')
         url = CONFIG.POLICY_DOCS_URL.format(policy_id=rec_id_upper)
-        cell = ws.cell(row=row_num, column=7)
+        cell = ws.cell(row=row_num, column=9)
         cell.value = rec_id
         cell.hyperlink = url
         cell.font = Font(color=CONFIG.EXCEL_LINK_COLOR, underline="single")
     else:
-        ws.cell(row=row_num, column=7, value='')
+        ws.cell(row=row_num, column=9, value='')
 
     # Tags
-    ws.cell(row=row_num, column=8, value=rec.get('TAGS', ''))
+    ws.cell(row=row_num, column=10, value=rec.get('TAGS', ''))
 
 
 def _format_status(status: str) -> str:
@@ -2000,6 +2006,17 @@ def concatenate_reports(
     all_recommendations, all_accounts = _collect_recommendations(report_files, verbose)
     total_recommendations = len(all_recommendations)
     Logger.verbose(f"Total recommendations collected: {total_recommendations}", verbose)
+
+    # Enrich recommendations with policy metadata (remediation text)
+    if env and output_format != OutputFormat.JSON:
+        Logger.info("Fetching policy metadata for remediation details...")
+        all_policies = _fetch_all_policies(env, verbose)
+        if all_policies:
+            for rec in all_recommendations:
+                rec_id = rec.get('REC_ID', '')
+                if rec_id and not rec.get('REMEDIATION'):
+                    policy = all_policies.get(rec_id, {})
+                    rec['REMEDIATION'] = policy.get('remediation', '')
 
     # Fetch resource tags from inventory API
     tags_lookup = {}
