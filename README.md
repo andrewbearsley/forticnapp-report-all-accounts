@@ -205,16 +205,18 @@ Report names must match exactly as configured in your Lacework instance. Common 
 
 **Excel Format** (default):
 - Creates a spreadsheet with two sheets:
-  - **Summary**: Overall compliance statistics across all accounts
-  - **Recommendations**: One row per violation, with columns: Section, Service, Policy, Link, Severity, Account, Status, Resource, Tags
+  - **Summary**: Overview metrics and non-compliant policies table sorted by severity
+  - **Recommendations**: One row per violation, with columns: Section, Policy, Severity, Account, Account Name, Status, Resource, First Seen, Remediation, Docs, Tags
 - Features:
   - Each violation expanded to its own row with the individual resource identifier
-  - Resource tags fetched from the inventory API and populated in the Tags column (use `--skip-tags` to disable)
+  - Account Name resolved from the cloud provider (e.g., AWS account alias)
+  - First Seen date tracked via local CSV history (see Violation History below)
+  - Remediation steps fetched from the Policies API
+  - Docs column with clickable links to Fortinet policy documentation
+  - Resource tags fetched from the inventory API (use `--skip-tags` to disable)
   - Default: only NonCompliant rows shown (use `--include-compliant` for all statuses)
   - Auto-filters on all columns
-  - Hyperlinked policy IDs (REC_ID) to Fortinet documentation
   - Severity labels (Critical, High, Medium, Low, Info)
-  - Sorted by Category > Service (blank last) > Severity > Rec_id > Account_id > Resource
 
 **JSON Format**:
 - Creates a single JSON file matching the structure of individual account reports
@@ -222,6 +224,15 @@ Report names must match exactly as configured in your Lacework instance. Common 
   - `reportTitle`, `reportType`, `reportTime`
   - `recommendations`: Array of all recommendations from all accounts
   - `summary`: Single summary object with aggregated statistics
+
+### Violation History (First Seen)
+
+The script tracks when each violation was first detected using a local CSV history file stored in the `history/` directory. Each report gets its own history file (e.g., `history/My Custom AWS Framework.csv`).
+
+- **First run**: All violations are recorded with today's date
+- **Subsequent runs**: Existing violations keep their original first-seen date; only new violations get the current date
+- The history file is keyed on `(policy_id, account_id, resource)` — so the same misconfiguration on the same resource in the same account is tracked as one entry
+- History files are local and not committed to git — each environment maintains its own history
 
 
 ## References
