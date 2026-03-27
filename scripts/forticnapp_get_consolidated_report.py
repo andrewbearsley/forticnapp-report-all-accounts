@@ -1156,18 +1156,30 @@ def _fetch_reports_via_lql(
         sys.exit(1)
     Logger.info(f"Loaded metadata for {len(all_policies)} policies")
 
-    # 3. Extract policy IDs from sections
+    # 3. Extract policy IDs from sections (deduplicate across sections)
     policy_section_map: Dict[str, str] = {}  # {policy_id: section_title}
     all_policy_ids: List[str] = []
+    seen_pids: set = set()
+    duplicates_skipped = 0
     for section in sections:
         section_title = section.get('title', section.get('category', ''))
         for pid in section.get('policies', []):
+            if pid in seen_pids:
+                duplicates_skipped += 1
+                Logger.verbose(
+                    f"Skipping duplicate policy {pid} "
+                    f"(already in '{policy_section_map[pid]}', "
+                    f"also in '{section_title}')", verbose)
+                continue
+            seen_pids.add(pid)
             policy_section_map[pid] = section_title
             all_policy_ids.append(pid)
 
     Logger.info(
         f"Report has {len(sections)} sections, "
-        f"{len(all_policy_ids)} policies"
+        f"{len(all_policy_ids)} unique policies"
+        + (f" ({duplicates_skipped} cross-section duplicates skipped)"
+           if duplicates_skipped else "")
     )
 
     # Test mode: limit to first 3 policies per section
@@ -1864,8 +1876,13 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
     For compliant recommendations (when include_compliant=True): one row with
     empty Resource/Tags.
     For non-compliant with no violations: one row with empty Resource/Tags.
+
+    Deduplicates by (REC_ID, ACCOUNT_ID, resource) to handle policies that
+    appear in multiple report sections with identical violations.
     """
     rows = []
+    seen_keys: set = set()  # (REC_ID, ACCOUNT_ID, resource) for dedup
+    duplicates_skipped = 0
     for rec in recommendations:
         status = rec.get('STATUS', '')
         violations = rec.get('VIOLATIONS', [])
@@ -1874,13 +1891,16 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
         if not is_non_compliant and not include_compliant:
             continue
 
+        rec_id = rec.get('REC_ID', '')
+        account_id = rec.get('ACCOUNT_ID', '')
+
         # Base row data shared across all expanded rows for this recommendation
         base = {
             'CATEGORY': rec.get('CATEGORY', ''),
             'TITLE': rec.get('TITLE', ''),
-            'REC_ID': rec.get('REC_ID', ''),
+            'REC_ID': rec_id,
             'SEVERITY': rec.get('SEVERITY', ''),
-            'ACCOUNT_ID': rec.get('ACCOUNT_ID', ''),
+            'ACCOUNT_ID': account_id,
             'ACCOUNT_ALIAS': rec.get('ACCOUNT_ALIAS', ''),
             'STATUS': status,
             'REMEDIATION': rec.get('REMEDIATION', ''),
@@ -1888,8 +1908,13 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
 
         if violations:
             for v in violations:
-                row = dict(base)
                 resource = v.get('resource', '')
+                dedup_key = (rec_id, account_id, resource)
+                if dedup_key in seen_keys:
+                    duplicates_skipped += 1
+                    continue
+                seen_keys.add(dedup_key)
+                row = dict(base)
                 row['RESOURCE'] = resource
                 row['FIRST_SEEN'] = v.get('first_seen', '')
                 # Prefer tags from inventory lookup, fall back to inline tags
@@ -1897,11 +1922,21 @@ def _expand_recommendations_to_rows(recommendations: List[Dict], include_complia
                 row['TAGS'] = json.dumps(tags) if tags else ''
                 rows.append(row)
         else:
+            dedup_key = (rec_id, account_id, '')
+            if dedup_key in seen_keys:
+                duplicates_skipped += 1
+                continue
+            seen_keys.add(dedup_key)
             row = dict(base)
             row['RESOURCE'] = ''
             row['FIRST_SEEN'] = ''
             row['TAGS'] = ''
             rows.append(row)
+
+    if duplicates_skipped:
+        Logger.info(
+            f"Deduplicated {duplicates_skipped} cross-section duplicate "
+            f"violation(s)")
 
     return rows
 
